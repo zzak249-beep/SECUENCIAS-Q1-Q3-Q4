@@ -1,0 +1,77 @@
+# Copia este fichero a .env SOLO para pruebas locales (no lo subas a GitHub).
+# En Railway estas variables se ponen en la pestana "Variables" (ver README).
+# Los comentarios van en lineas aparte: el valor es todo lo que hay tras el "=".
+
+# ---------- OBLIGATORIAS ----------
+TELEGRAM_TOKEN=
+# Puedes poner varios chats separados por coma: 123456,-100987654
+TELEGRAM_CHAT_ID=
+
+# ---------- TU CUENTA (calculadora de posicion en cada senal) ----------
+# USDT. Vacio o 0 = no muestra tamano de posicion
+ACCOUNT_SIZE=1000
+# % de la cuenta que arriesgas por trade
+RISK_PER_TRADE_PCT=1
+# Tope de apalancamiento sugerido
+MAX_LEVERAGE=10
+
+# ---------- CANTIDAD Y CALIDAD DE SENALES ----------
+# 0 Asia, 1 Londres, 2 NY AM, 3 NY PM
+SESSIONS=1,2
+# 0-5. Sube para menos senales y mejores
+MIN_SCORE=3
+# Descarta senales con SL a mas de X% (0 = sin limite)
+MAX_RISK_PCT=3
+# Minutos sin repetir senal en la misma moneda
+SYMBOL_COOLDOWN_MIN=90
+# 0 = sin limite
+MAX_SIGNALS_PER_DAY=0
+MAX_SIGNALS_PER_SCAN=10
+# Volumen 24h minimo en USDT
+MIN_QUOTE_VOLUME=20000000
+# Ej: USDCUSDT,BTCDOMUSDT (vacio = ninguna)
+EXCLUDE_SYMBOLS=
+ALLOW_LONG=true
+ALLOW_SHORT=true
+
+# ---------- GESTION DEL TRADE ----------
+# TP2 en multiplos de R
+RR=2
+# TP1 en multiplos de R
+PARTIAL_R=1
+# % que se cierra en TP1 (el resto queda con SL en la entrada)
+PARTIAL_PCT=50
+# "No entres si el precio ya se movio mas de 0.3R"
+ENTRY_CHASE_R=0.3
+
+# ---------- SEGUIMIENTO Y RESUMEN ----------
+# Avisa de TP1 / TP2 / SL / caducidad respondiendo al mensaje original
+TRACK_SIGNALS=true
+TRACK_HOURS=6
+# Hora NY del resumen diario, -1 = desactivado
+DAILY_SUMMARY_HOUR=18
+
+# ---------- LOGICA QT (avanzado) ----------
+REQUIRE_CHAIN=true
+# none | true_opens
+BIAS_MODE=true_opens
+# manipulacion | tendencia
+TO_LOGIC=manipulacion
+# 90 Min | Micro | Nano
+LOWEST_LEVEL=90 Min
+# Ninguno | Yearly | Monthly | Weekly | Daily | 90 Min | Micro | Nano
+NEED_LEVEL=Daily
+MIN_DEPTH=3
+# Ambas | Normal | Puente
+CHAIN_KIND=Ambas
+BODY_PCT=40
+MAX_BARS_SWEEP=6
+MIN_SWEEP_ATR=0.2
+MAX_SWEEP_ATR=3
+SL_BUF_ATR=0.1
+
+# ---------- SISTEMA (opcionales) ----------
+# BINANCE_BASE_URL=https://fapi.binance.com
+# Solo si montas un Volume en Railway con mount path /data
+# STATE_FILE=/data/state.json
+# LOG_LEVEL=INFO

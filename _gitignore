@@ -1,0 +1,6 @@
+.env
+state.json
+state.json.tmp
+sent_signals.json
+__pycache__/
+*.pyc
