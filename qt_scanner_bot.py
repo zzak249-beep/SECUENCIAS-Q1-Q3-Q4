@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-QT Chain Scanner v6  -  escanea los perpetuos USDT de BingX (o Binance) Futures en 5m y envia
+QT Chain Scanner v6  -  escanea TODOS los perpetuos USDT de BingX (y/o Binance) en 5m y envia
 por Telegram senales LONG / SHORT listas para abrir A MANO. NO opera: solo avisa.
 
 Logica (replica del Pine "QT Chain Map + Entradas v3"):
@@ -15,18 +15,14 @@ Mejoras v4 (pensadas para trading manual):
   - Mensaje claro: entrada, "no entres si pasa de X", SL, TP1, TP2, % y R de cada nivel
   - Calculadora de posicion: cantidad, nocional y apalancamiento segun tu cuenta y riesgo
   - Puntuacion 1-5 de cada senal (cadena, sesgo, barrido limpio, vela fuerte) + filtro MIN_SCORE
-  - Botones en Telegram: abrir el par en el exchange / TradingView
+  - Botones en Telegram: abrir Binance Futures / TradingView
   - Seguimiento: avisa (respondiendo al mensaje original) cuando toca TP1, TP2, SL o caduca
   - Resumen diario con resultados simulados en R
   - Filtros: riesgo maximo, cooldown por moneda, limite diario, monedas excluidas
   - Todas las opciones se pueden cambiar con Variables de Railway (ver README)
 
-Novedades v6: soporte BingX (por defecto, todas las monedas USDT con volumen suficiente, sin los perpetuos
-TradFi), AUTOAJUSTE walk-forward con validacion (ver seccion AUTOAJUSTE), proteccion contra velas desfasadas,
---check-exchange para verificar la conexion.
-
 Mejoras v5 (diagnostico, validacion con datos y filtros con base en la investigacion):
-  - --backtest: reproduce la estrategia sobre el historico del exchange (comisiones incluidas) y
+  - --backtest: reproduce la estrategia sobre historico de Binance (comisiones incluidas) y
     muestra winrate, R medio, profit factor, drawdown y resultados por sesion/score/lado
   - --compare: prueba variantes (sin cadena, sin sesgo, otras sesiones, tendencia 1H, volumen...)
     y las separa en 1a/2a mitad del periodo para detectar sobreajuste
@@ -36,30 +32,33 @@ Mejoras v5 (diagnostico, validacion con datos y filtros con base en la investiga
   - Puntuacion 0-7 (suma tendencia 1H a favor y volumen relativo alto)
   - Resultados simulados NETOS de comisiones; caducidad valorada a precio de mercado
 
+Mejoras v6 (estrategia, ejecucion manual y validacion):
+  - BingX: todos los perpetuos USDT activos (EXCHANGE=bingx|binance|both), con respaldo de rutas y limitador
+  - Costes realistas: comision + deslizamiento por lado en todos los resultados simulados (SLIPPAGE_PCT)
+  - Filtros nuevos opcionales (se validan con --backtest --compare antes de activarlos):
+      REQUIRE_MSS (la vela de confirmacion rompe la estructura reciente), BTC_FILTER (no ir contra BTC 1H)
+  - Control del precio ANTES de avisar (FRESH_CHECK): no envia senales que ya se alejaron de la entrada
+  - Limite de exposicion: MAX_OPEN_PER_SIDE / MAX_OPEN_TOTAL (evita 10 shorts correlacionados a la vez)
+  - Validacion fuera de muestra en --compare: la variante elegida con la 1a mitad se juzga en la 2a
+  - Puntuacion 0-8 (suma ruptura de estructura)
+
 NO incluye (frente al Pine): filtro SMT con 2o activo, True Open Weekly, noticias.
 
 Uso:
     python qt_scanner_bot.py --selftest            # prueba offline de la logica
+    python qt_scanner_bot.py --check               # comprueba la conexion con el exchange (monedas y velas)
     python qt_scanner_bot.py --test-telegram       # mensaje de prueba + senal de ejemplo
     python qt_scanner_bot.py --once --dry-run      # un escaneo, solo imprime
-    python qt_scanner_bot.py --check-exchange      # verifica la conexion con BingX/Binance y el formato de datos
-    python qt_scanner_bot.py --autotune            # ejecuta una vez el autoajuste y muestra el ranking (no aplica)
-    python qt_scanner_bot.py --backtest --days 14  # backtest + embudo de filtros
+    python qt_scanner_bot.py --backtest --days 14  # backtest + embudo de filtros (necesita Binance)
     python qt_scanner_bot.py --backtest --compare  # ademas compara variantes de la estrategia
     python qt_scanner_bot.py                       # bucle continuo cada 5 min
 Aviso: no es consejo financiero. Prueba en demo / papel antes de usar dinero real.
 """
 import argparse
-import contextlib
-import hashlib
-import hmac
-import io
 import json
 import logging
 import math
 import os
-import random
-import re
 import sys
 import threading
 import time
@@ -78,7 +77,7 @@ UTC = timezone.utc
 LEVELS = ["Yearly", "Monthly", "Weekly", "Daily", "90 Min", "Micro", "Nano"]
 SESSION_NAMES = ["Asia", "Londres", "NY AM", "NY PM"]
 BAR_MS = 300_000
-SCORE_MAX = 7
+SCORE_MAX = 8
 log = logging.getLogger("qt")
 
 
@@ -88,12 +87,16 @@ log = logging.getLogger("qt")
 # ============================================================================
 @dataclass
 class Config:
-    exchange: str = "bingx"                      # "bingx" | "binance"
-    base_url: str = "https://open-api.bingx.com" # env: BASE_URL (por defecto segun el exchange)
-    include_tradfi: bool = False                 # BingX: incluir perpetuos de acciones/materias primas/forex
+    exchange: str = "bingx"                      # "bingx" | "binance" | "both"
+    base_url: str = "https://fapi.binance.com"   # env: BINANCE_BASE_URL
+    bingx_url: str = "https://open-api.bingx.com"  # env: BINGX_BASE_URL
+    bingx_rps: float = 8.0                       # peticiones/segundo a BingX (baja si ves limites)
+    include_non_crypto: bool = False             # BingX: incluir perpetuos de acciones/materias primas/forex
     interval: str = "5m"                         # fijo (la logica de ciclos es de 5m)
-    klines_limit: int = 499                      # fijo (~41 h de velas de 5m, peso 2 en la API)
-    min_quote_volume: float = 20_000_000.0       # volumen 24h minimo en USDT
+    klines_limit: int = 499                      # fijo (~41 h de velas de 5m)
+    scan_delay_sec: float = 5.0                  # segundos de espera tras el cierre de la vela de 5m
+    # volumen 24h minimo en USDT. -1 = automatico (BingX 1M, Binance 20M). 0 = analizar todas
+    min_quote_volume: float = -1.0
     max_symbols: int = 0                         # 0 = sin limite
     exclude_symbols: tuple = ()                  # ej. "BTCDOMUSDT,USDCUSDT"
     workers: int = 8
@@ -122,12 +125,14 @@ class Config:
     trend_filter: bool = False                   # exige tendencia 1H a favor (precio vs EMA y pendiente)
     trend_ema_bars: int = 240                    # EMA en velas de 5m (240 = EMA 20 de 1H aprox.)
     min_rel_vol: float = 0.0                     # volumen vela confirmacion / media 20 velas (0 = off)
-    fee_pct: float = 0.05                        # comision taker por lado en % (BingX/Binance base: 0.05)
-    slip_pct: float = 0.02                       # deslizamiento estimado por lado en % (backtest, autoajuste y filtro de costes)
-    max_slip_r: float = 0.20                     # señal en vivo: descarta si el impacto REAL en el libro (ida y vuelta) > X R (0 = off)
-    max_open_per_side: int = 5                   # maximo de señales abiertas en el mismo lado (las altcoins se mueven juntas; 0 = sin limite)
-    btc_filter: bool = False                     # no operar contra la tendencia 1H de BTC
-    max_fee_r: float = 0.35                      # descarta si comisiones ida y vuelta > X R (0 = off)
+    fee_pct: float = 0.05                        # comision taker por lado en % (Binance base: 0.05)
+    max_fee_r: float = 0.35                      # descarta si costes ida y vuelta > X R (0 = off)
+    slippage_pct: float = 0.02                   # deslizamiento estimado por lado en % (entrada a mercado)
+    require_mss: bool = False                    # la vela de confirmacion rompe el extremo de las 3 velas previas
+    btc_filter: bool = False                     # no operar en contra de la tendencia 1H de BTC
+    fresh_check: bool = True                     # antes de avisar, comprueba el precio actual
+    max_open_per_side: int = 4                   # max señales abiertas (en seguimiento) por lado, 0 = sin limite
+    max_open_total: int = 8                      # max señales abiertas en total, 0 = sin limite
     rr: float = 2.0
     partial_r: float = 1.0
     partial_pct: float = 50.0                    # % de la posicion que se cierra en TP1
@@ -150,21 +155,10 @@ class Config:
     track_hours: float = 6.0
     daily_summary_hour: int = 18                 # hora NY del resumen, -1 = desactivado
     heartbeat_hours: float = 8.0                 # aviso "sigo activo" + que filtra mas (0 = off)
-    # autoajuste (walk-forward) -- ver seccion AUTOAJUSTE
-    autotune: bool = True                        # reevalua variantes con datos recientes y adopta la validada
-    autotune_mode: str = "apply"                 # "apply" aplica el cambio | "suggest" solo lo propone por Telegram
-    autotune_hours: float = 24.0                 # cada cuantas horas reajusta
-    autotune_days: int = 21                      # dias de historico (2/3 entrenamiento, 1/3 validacion)
-    autotune_top: int = 0                        # monedas usadas para ajustar (0 = TODAS). Si limitas: 1/3 liquidas + muestra rotativa del resto
-    autotune_max_minutes: float = 25.0           # presupuesto de tiempo del autoajuste
-    autotune_min_trades: int = 40                # operaciones minimas simuladas para fiarse de una variante
-    autotune_z: float = 2.2                      # cota inferior = R medio - z * error estandar
-    autotune_min_gain_r: float = 0.10            # mejora minima (en R) sobre la actual para cambiar
 
 
-DEFAULT_URL = {"bingx": "https://open-api.bingx.com", "binance": "https://fapi.binance.com"}
-ENV_ALIASES = {}
-ENV_SKIP = {"interval", "klines_limit", "base_url"}
+ENV_ALIASES = {"base_url": "BINANCE_BASE_URL", "bingx_url": "BINGX_BASE_URL"}
+ENV_SKIP = {"interval", "klines_limit"}
 
 
 def _to_bool(v):
@@ -198,22 +192,14 @@ def apply_env(cfg):
             log.warning("valor invalido %s=%r: se usa el de por defecto", name, raw)
             continue
         setattr(cfg, f.name, val)
+    cfg.base_url = cfg.base_url.rstrip("/")
+    cfg.bingx_url = cfg.bingx_url.rstrip("/")
     cfg.exchange = cfg.exchange.strip().lower()
-    explicit = os.environ.get("BASE_URL", "").strip()
-    if not explicit and cfg.exchange == "binance":
-        explicit = os.environ.get("BINANCE_BASE_URL", "").strip()
-    cfg.base_url = (explicit or DEFAULT_URL.get(cfg.exchange, cfg.base_url)).rstrip("/")
     return cfg
 
 
 def validate(cfg):
     errs = []
-    if cfg.exchange not in DEFAULT_URL:
-        errs.append("EXCHANGE debe ser bingx o binance (es %r)" % cfg.exchange)
-    if cfg.autotune_mode not in ("apply", "suggest"):
-        errs.append("AUTOTUNE_MODE debe ser apply o suggest (es %r)" % cfg.autotune_mode)
-    if cfg.autotune_days < 7 or cfg.autotune_top < 0 or 0 < cfg.autotune_top < 5:
-        errs.append("AUTOTUNE_DAYS >= 7 y AUTOTUNE_TOP = 0 (todas) o >= 5")
     if cfg.lowest_level not in LEVELS[4:]:
         errs.append("LOWEST_LEVEL debe ser '90 Min', 'Micro' o 'Nano' (es %r)" % cfg.lowest_level)
     if cfg.need_level != "Ninguno" and cfg.need_level not in LEVELS:
@@ -230,10 +216,16 @@ def validate(cfg):
         errs.append("PARTIAL_PCT debe estar entre 0 y 100")
     if cfg.rr <= 0 or cfg.partial_r <= 0:
         errs.append("RR y PARTIAL_R deben ser > 0")
-    if min(cfg.fee_pct, cfg.max_fee_r, cfg.slip_pct, cfg.max_slip_r, cfg.max_open_per_side) < 0:
-        errs.append("FEE_PCT, SLIP_PCT, MAX_FEE_R, MAX_SLIP_R y MAX_OPEN_PER_SIDE no pueden ser negativos")
+    if cfg.fee_pct < 0 or cfg.max_fee_r < 0:
+        errs.append("FEE_PCT y MAX_FEE_R no pueden ser negativos")
     if not 20 <= cfg.trend_ema_bars <= 400:
         errs.append("TREND_EMA_BARS debe estar entre 20 y 400")
+    if cfg.exchange not in ("bingx", "binance", "both"):
+        errs.append("EXCHANGE debe ser bingx, binance o both (es %r)" % cfg.exchange)
+    if cfg.bingx_rps <= 0:
+        errs.append("BINGX_RPS debe ser > 0")
+    if cfg.slippage_pct < 0:
+        errs.append("SLIPPAGE_PCT no puede ser negativo")
     return errs
 
 
@@ -321,11 +313,6 @@ def atr_series(bars, n=14):
     return out
 
 
-def cost_r(cfg, entry, risk):
-    """Costes ida y vuelta (comision taker + deslizamiento estimado, ambos por lado) expresados en R."""
-    return 2.0 * (cfg.fee_pct + cfg.slip_pct) / (risk / entry * 100.0)
-
-
 def ema_series(values, n):
     """EMA con semilla SMA; None hasta tener n valores."""
     out = [None] * len(values)
@@ -372,7 +359,7 @@ def bias_for(bars, mins_arr, idx, qi, cfg):
 # ============================================================================
 #  MOTOR DE ENTRADA (barrido del Q1 del ciclo de 90 min)
 # ============================================================================
-GATES = ("sesion", "cadena", "q1", "barrido", "vela", "sesgo", "tendencia", "btc", "volumen", "una_por_ciclo")
+GATES = ("sesion", "cadena", "q1", "barrido", "vela", "mss", "sesgo", "tendencia", "btc", "volumen", "una_por_ciclo")
 GATE_TEXT = {
     "sesion": "fuera de las sesiones elegidas",
     "cadena": "sin cadena QT abierta",
@@ -381,10 +368,9 @@ GATE_TEXT = {
     "vela": "sin vela de confirmacion fuerte",
     "sesgo": "sesgo True Open en contra",
     "tendencia": "tendencia 1H en contra",
-    "btc": "BTC en contra",
+    "mss": "sin ruptura de estructura",
+    "btc": "BTC 1H en contra",
     "volumen": "volumen relativo bajo",
-    "liquidez": "liquidez insuficiente (spread/impacto en el libro)",
-    "concentracion": "demasiadas señales abiertas en el mismo lado",
     "una_por_ciclo": "ya hubo senal en este ciclo",
     "riesgo": "SL demasiado grande/pequeno o comisiones altas",
 }
@@ -408,6 +394,20 @@ def _eval_gates(gates, funnel):
     return not fails
 
 
+def trend_series(bars, cfg):
+    """Tendencia por vela: +1 alcista (cierre > EMA y EMA subiendo), -1 bajista, 0 neutra/sin datos."""
+    ema = ema_series([b["c"] for b in bars], cfg.trend_ema_bars)
+    out = [0] * len(bars)
+    for i, b in enumerate(bars):
+        e = ema[i]
+        if e is not None and i >= 12 and ema[i - 12] is not None:
+            if b["c"] > e and e > ema[i - 12]:
+                out[i] = 1
+            elif b["c"] < e and e < ema[i - 12]:
+                out[i] = -1
+    return out
+
+
 def prepare_series(bars, cfg):
     """Calculos que no dependen de los filtros (se reutilizan entre variantes del backtest)."""
     qinfos = [quarters(b["t"]) for b in bars]
@@ -415,39 +415,19 @@ def prepare_series(bars, cfg):
         "atr": atr_series(bars),
         "qinfos": qinfos,
         "mins": [q["mins"] for q in qinfos],
-        "closes": [b["c"] for b in bars],
-        "ema": ema_series([b["c"] for b in bars], cfg.trend_ema_bars),
+        "trend": trend_series(bars, cfg),
         "vols": [b.get("v", 0.0) for b in bars],
     }
 
 
-def trend_of(bars_c, ema, i):
-    """+1 alcista, -1 bajista, 0 neutra/sin datos (precio vs EMA y pendiente de la EMA)."""
-    e = ema[i]
-    if e is not None and i >= 12 and ema[i - 12] is not None:
-        if bars_c[i] > e and e > ema[i - 12]:
-            return 1
-        if bars_c[i] < e and e < ema[i - 12]:
-            return -1
-    return 0
-
-
-def btc_trend_map(bars, n):
-    """{t_vela: tendencia} de BTC para el filtro de contexto."""
-    closes = [b["c"] for b in bars]
-    ema = ema_series(closes, n)
-    return {b["t"]: trend_of(closes, ema, i) for i, b in enumerate(bars)}
-
-
-def scan_series(symbol, bars, tick, cfg, only_last=True, funnel=None, prep=None, btc=None):
-    """Recorre las velas CERRADAS [{t,o,h,l,c,v}].
+def scan_series(symbol, bars, tick, cfg, only_last=True, funnel=None, prep=None, ref=None):
+    """Recorre las velas CERRADAS [{t,o,h,l,c,v}]. 'ref' = tendencia 1H de BTC (int en vivo, dict t->tendencia en backtest).
     only_last=True  -> solo senales de la ultima vela (modo en vivo).
     only_last=False -> senales de todas las velas (backtest); cada senal lleva 'bar_i'."""
     if len(bars) < 40:
         return []
     p = prep or prepare_series(bars, cfg)
-    atr, qinfos, mins_arr, ema, vols = p["atr"], p["qinfos"], p["mins"], p["ema"], p["vols"]
-    closes = p["closes"]
+    atr, qinfos, mins_arr, trends, vols = p["atr"], p["qinfos"], p["mins"], p["trend"], p["vols"]
     last = len(bars) - 1
     i0 = 0
     if only_last:
@@ -511,7 +491,14 @@ def scan_series(symbol, bars, tick, cfg, only_last=True, funnel=None, prep=None,
         strong_bull = b["c"] > b["o"] and rng > 0 and body >= cfg.body_pct / 100.0 * rng
         bull_bias, bear_bias, bias_levels = bias_for(bars, mins_arr, i, qi, cfg)
 
-        trend = trend_of(closes, ema, i)                       # +1 alcista, -1 bajista, 0 neutra/sin datos
+        trend = trends[i]                                      # +1 alcista, -1 bajista, 0 neutra/sin datos
+        mss_bear = mss_bull = False                            # ruptura de estructura: cierra mas alla de las 3 velas previas
+        if i >= 3:
+            mss_bear = b["c"] < min(x["l"] for x in bars[i - 3:i])
+            mss_bull = b["c"] > max(x["h"] for x in bars[i - 3:i])
+        rt = 0                                                 # tendencia 1H de BTC (0 = neutra o sin datos)
+        if ref is not None:
+            rt = ref.get(b["t"], 0) if isinstance(ref, dict) else ref
         rv = 0.0
         if i >= 21:
             base = sum(vols[i - 20:i]) / 20.0
@@ -526,33 +513,34 @@ def scan_series(symbol, bars, tick, cfg, only_last=True, funnel=None, prep=None,
             "bias_levels": bias_levels,
             "body_ratio": (body / rng) if rng > 0 else 0.0,
             "rel_vol": rv,
+            "btc": rt if ref is not None else None,
         }
         for side in ("SHORT", "LONG"):
             if side == "SHORT":
                 if not cfg.allow_short:
                     continue
                 gates = [("sesion", session_ok), ("cadena", seq_ok), ("q1", q1_ok), ("barrido", sweep_ok_hi),
-                         ("vela", strong_bear and b["c"] < q1_hi), ("sesgo", bear_bias),
-                         ("tendencia", (not cfg.trend_filter) or trend == -1),
-                         ("btc", (not cfg.btc_filter) or not btc or btc.get(b["t"], 0) != 1), ("volumen", vol_ok),
+                         ("vela", strong_bear and b["c"] < q1_hi), ("mss", (not cfg.require_mss) or mss_bear),
+                         ("sesgo", bear_bias), ("tendencia", (not cfg.trend_filter) or trend == -1),
+                         ("btc", (not cfg.btc_filter) or rt != 1), ("volumen", vol_ok),
                          ("una_por_ciclo", not done_s)]
             else:
                 if not cfg.allow_long:
                     continue
                 gates = [("sesion", session_ok), ("cadena", seq_ok), ("q1", q1_ok), ("barrido", sweep_ok_lo),
-                         ("vela", strong_bull and b["c"] > q1_lo), ("sesgo", bull_bias),
-                         ("tendencia", (not cfg.trend_filter) or trend == 1),
-                         ("btc", (not cfg.btc_filter) or not btc or btc.get(b["t"], 0) != -1), ("volumen", vol_ok),
+                         ("vela", strong_bull and b["c"] > q1_lo), ("mss", (not cfg.require_mss) or mss_bull),
+                         ("sesgo", bull_bias), ("tendencia", (not cfg.trend_filter) or trend == 1),
+                         ("btc", (not cfg.btc_filter) or rt != -1), ("volumen", vol_ok),
                          ("una_por_ciclo", not done_l)]
             if not _eval_gates(gates, funnel if count else None):
                 continue
             if side == "SHORT":
                 done_s = True
-                ex = dict(extra, sweep_atr=depth_hi / a, q1_level=q1_hi, trend_ok=(trend == -1))
+                ex = dict(extra, sweep_atr=depth_hi / a, q1_level=q1_hi, trend_ok=(trend == -1), mss=mss_bear)
                 sl = c_hi + cfg.sl_buf_atr * a
             else:
                 done_l = True
-                ex = dict(extra, sweep_atr=depth_lo / a, q1_level=q1_lo, trend_ok=(trend == 1))
+                ex = dict(extra, sweep_atr=depth_lo / a, q1_level=q1_lo, trend_ok=(trend == 1), mss=mss_bull)
                 sl = c_lo - cfg.sl_buf_atr * a
             if not emit_here:
                 continue
@@ -567,14 +555,14 @@ def scan_series(symbol, bars, tick, cfg, only_last=True, funnel=None, prep=None,
     return signals
 
 
-def analyze(symbol, bars, tick, cfg, funnel=None, btc=None):
+def analyze(symbol, bars, tick, cfg, funnel=None, ref=None):
     """Modo en vivo: senales de la ultima vela cerrada."""
-    return scan_series(symbol, bars, tick, cfg, only_last=True, funnel=funnel, btc=btc)
+    return scan_series(symbol, bars, tick, cfg, only_last=True, funnel=funnel, ref=ref)
 
 
 def score_signal(ex, cfg):
-    """Puntuacion 0-7: cadena, cadena profunda, sesgo True Open, barrido limpio, vela fuerte,
-    tendencia 1H a favor y volumen relativo alto."""
+    """Puntuacion 0-8: cadena, cadena profunda, sesgo True Open, barrido limpio, vela fuerte,
+    tendencia 1H a favor, volumen relativo alto y ruptura de estructura."""
     s = 0
     if ex["chain_depth"] >= 1:
         s += 1
@@ -590,6 +578,8 @@ def score_signal(ex, cfg):
         s += 1
     if ex.get("rel_vol", 0.0) >= 1.5:
         s += 1
+    if ex.get("mss"):
+        s += 1
     return s
 
 
@@ -601,7 +591,7 @@ def _build_signal(symbol, side, bar, sl, tick, cfg, chain, qi, cycle_start_ms, e
     risk_pct = risk / entry * 100.0
     if cfg.max_risk_pct > 0 and risk_pct > cfg.max_risk_pct:
         return None
-    fee_r = cost_r(cfg, entry, risk)                          # comisiones + deslizamiento, ida y vuelta, en R
+    fee_r = 2.0 * (cfg.fee_pct + cfg.slippage_pct) / risk_pct                      # comisiones ida y vuelta expresadas en R
     if cfg.max_fee_r > 0 and fee_r > cfg.max_fee_r:
         return None
     sgn = -1 if side == "SHORT" else 1
@@ -626,6 +616,8 @@ def _build_signal(symbol, side, bar, sl, tick, cfg, chain, qi, cycle_start_ms, e
         "bias_rel": "sobre" if above else "bajo",
         "rel_vol": ex.get("rel_vol", 0.0),
         "trend_ok": bool(ex.get("trend_ok")),
+        "mss": bool(ex.get("mss")),
+        "btc": ex.get("btc"),
     }
 
 
@@ -651,7 +643,7 @@ def position_size(s, cfg):
     step = s.get("step") or 0.0
     if step > 0:
         qty = math.floor(qty / step + 1e-9) * step
-    if qty <= 0:
+    if qty <= 0 or qty < (s.get("min_qty") or 0.0):
         return {"qty": 0.0}
     notional = qty * s["entry"]
     return {
@@ -675,11 +667,8 @@ def format_message(s, cfg):
     stars = "⭐" * s["score"] + "☆" * (SCORE_MAX - s["score"])
     pf = cfg.partial_pct
     lines = [
-        "%s <b>%s · %s</b>   %s %d/%d" % (icon, s["side"], s["symbol"], stars, s["score"], SCORE_MAX),
-    ]
-    if RUNTIME.get("edge") is False:
-        lines.append("⚠️ <i>Experimental: el ultimo autoajuste no encontro ventaja validada.</i>")
-    lines += [
+        "%s <b>%s · %s</b> · %s   %s %d/%d" % (icon, s["side"], s["symbol"],
+                                               EXCHANGES[s.get("exchange", "bingx")].label, stars, s["score"], SCORE_MAX),
         "",
         "📍 Entrada: <code>%s</code>  (mercado o limit)" % fp(s["entry"]),
         "     No entres %s de <code>%s</code>" % ("por encima" if is_long else "por debajo", fp(s["max_entry"])),
@@ -688,6 +677,8 @@ def format_message(s, cfg):
             fp(s["tp1"]), pct(s["tp1"]), cfg.partial_r, pf),
         "🏁 TP2: <code>%s</code>  (+%.2f%% · %.1fR)  → cierra el resto" % (fp(s["tp2"]), pct(s["tp2"]), cfg.rr),
     ]
+    if s.get("price_now"):
+        lines.insert(4, "     Precio ahora: <code>%s</code>" % fp(s["price_now"]))
     ps = position_size(s, cfg)
     if ps is not None:
         lines.append("")
@@ -709,16 +700,13 @@ def format_message(s, cfg):
         "minimo" if is_long else "maximo", fp(s["q1_level"])))
     lines.append("📊 Volumen vela x%.1f · Tendencia 1H %s" % (
         s.get("rel_vol", 0.0), "a favor" if s.get("trend_ok") else "neutra o en contra"))
+    if s.get("btc") is not None:
+        lines.append("₿ BTC 1H: %s" % {1: "alcista", -1: "bajista", 0: "neutra"}.get(s["btc"], "neutra"))
+    if s.get("mss"):
+        lines.append("🔨 Ruptura de estructura confirmada (rompe el extremo de las 3 velas previas)")
     if s.get("fee_r") is not None:
         lines.append("💸 Costes ida y vuelta ≈ %.2fR (comision %.2f%% + deslizamiento %.2f%% por lado)" % (
-            s["fee_r"], cfg.fee_pct, cfg.slip_pct))
-    if "liq" in s:
-        lq = s["liq"]
-        if lq is None:
-            lines.append("💧 Liquidez no verificada (libro de ordenes no disponible)")
-        else:
-            lines.append("💧 Liquidez: spread %.3f%% · impacto de %.0f USDT %.3f%% ≈ %.2fR ida y vuelta" % (
-                lq["spread"], lq["notional"], lq["impact"], lq["cost_r"]))
+            s["fee_r"], cfg.fee_pct, cfg.slippage_pct))
     lines.append("🕐 %s · vela 5m cerrada %s NY" % (s["session"], s["time_ny"]))
     lines.append("<i>Solo aviso, no es consejo financiero.</i>")
     return "\n".join(lines)
@@ -740,25 +728,36 @@ def format_event(sig, kind, r, cfg):
             "cierre: %+.2fR (neto). Si sigues dentro, gestiona el trade tu." % (head, cfg.track_hours, r))
 
 
-def buttons_for(symbol, exchange="bingx"):
-    if exchange == "bingx":
-        return [
-            {"text": "📈 BingX Futures", "url": "https://bingx.com/en/perpetual/%s" % symbol},
-            {"text": "📊 TradingView", "url": "https://www.tradingview.com/chart/?symbol=BINGX%%3A%s.P" % symbol.replace("-", "")},
-        ]
-    return [
-        {"text": "📈 Binance Futures", "url": "https://www.binance.com/en/futures/%s" % symbol},
-        {"text": "📊 TradingView", "url": "https://www.tradingview.com/chart/?symbol=BINANCE%%3A%s.P" % symbol},
-    ]
+def buttons_for(s):
+    return EXCHANGES[s.get("exchange", "bingx")].buttons(s["symbol"])
 
 
 # ============================================================================
-#  EXCHANGE (BingX / Binance) + TELEGRAM
+#  EXCHANGES (BingX / Binance) + TELEGRAM
 # ============================================================================
-def http_get(url, params=None, tries=3, headers=None):
+def norm_sym(x):
+    """BTC-USDT, BTCUSDT, btc/usdt -> BTCUSDT"""
+    return str(x).upper().replace("-", "").replace("_", "").replace("/", "")
+
+
+def _to_int(v, default=None):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def http_get(url, params=None, tries=3):
     for k in range(tries):
         try:
-            r = requests.get(url, params=params or {}, headers=headers, timeout=10)
+            r = requests.get(url, params=params or {}, timeout=10)
             if r.status_code in (418, 429):
                 time.sleep(min(int(r.headers.get("Retry-After", "5")), 60))
                 continue
@@ -771,246 +770,322 @@ def http_get(url, params=None, tries=3, headers=None):
     raise RuntimeError("limite de peticiones: reintentos agotados")
 
 
-# ---- BingX (perpetuos USDT, simbolos tipo BTC-USDT) ----
-_thr_lock = threading.Lock()
-_thr_next = [0.0]
+def _row_to_bar(r):
+    return {"t": int(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]),
+            "v": float(r[7])}                              # v = volumen en USDT
 
 
-def _throttle(rate=30.0):
-    """Limita las peticiones a BingX a ~30/s (el limite de datos de mercado es mayor, asi hay margen)."""
-    with _thr_lock:
-        now = time.time()
-        slot = max(now, _thr_next[0])
-        _thr_next[0] = slot + 1.0 / rate
-    if slot > now:
-        time.sleep(slot - now)
+class BinanceAPI:
+    """Binance USDT-M Futures (API publica, sin clave)."""
+    name = "binance"
+    label = "Binance"
+    btc_symbol = "BTCUSDT"
+
+    @staticmethod
+    def load_symbols(cfg, only=None):
+        """Devuelve (symbols, meta) con meta[symbol] = {"tick", "step", "min_qty"}."""
+        info = http_get(cfg.base_url + "/fapi/v1/exchangeInfo")
+        meta, syms = {}, []
+        for s_ in info["symbols"]:
+            if s_.get("contractType") == "PERPETUAL" and s_.get("status") == "TRADING" and s_.get("quoteAsset") == "USDT":
+                m = {"tick": 0.0001, "step": 0.0, "min_qty": 0.0}
+                for f in s_.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER":
+                        m["tick"] = float(f["tickSize"])
+                    elif f.get("filterType") == "LOT_SIZE":
+                        m["step"] = float(f["stepSize"])
+                        m["min_qty"] = float(f.get("minQty", 0))
+                meta[s_["symbol"]] = m
+                syms.append(s_["symbol"])
+        vols = {x["symbol"]: float(x["quoteVolume"]) for x in http_get(cfg.base_url + "/fapi/v1/ticker/24hr")}
+        minv = cfg.min_quote_volume if cfg.min_quote_volume >= 0 else 20_000_000.0
+        excl = {norm_sym(x) for x in cfg.exclude_symbols}
+        if only:
+            only_n = {norm_sym(x) for x in only}
+            syms = [x for x in syms if norm_sym(x) in only_n]
+        else:
+            syms = [x for x in syms if vols.get(x, 0.0) >= minv and norm_sym(x) not in excl]
+        syms.sort(key=lambda x: -vols.get(x, 0.0))
+        if cfg.max_symbols:
+            syms = syms[:cfg.max_symbols]
+        return syms, meta
+
+    @staticmethod
+    def fetch_bars(cfg, symbol):
+        rows = http_get(cfg.base_url + "/fapi/v1/klines",
+                        {"symbol": symbol, "interval": cfg.interval, "limit": cfg.klines_limit})
+        now_ms = int(time.time() * 1000)
+        return [_row_to_bar(r) for r in rows if int(r[6]) < now_ms]   # solo velas cerradas
+
+    @staticmethod
+    def fetch_history(cfg, symbol, days):
+        return binance_history(cfg, symbol, days)
+
+    @staticmethod
+    def last_price(cfg, symbol):
+        return float(http_get(cfg.base_url + "/fapi/v1/ticker/price", {"symbol": symbol})["price"])
+
+    @staticmethod
+    def buttons(symbol):
+        return [
+            {"text": "📈 Binance Futures", "url": "https://www.binance.com/en/futures/%s" % symbol},
+            {"text": "📊 TradingView", "url": "https://www.tradingview.com/chart/?symbol=BINANCE%%3A%s.P" % symbol},
+        ]
 
 
-def bx_get(cfg, path, params=None):
-    """GET a BingX. Si defines BINGX_API_KEY y BINGX_API_SECRET firma la peticion (solo lectura basta);
-    los datos de mercado normalmente funcionan sin clave."""
-    for k in range(4):
-        _throttle()
-        p = dict(params or {})
-        p["timestamp"] = int(time.time() * 1000)               # BingX lo pide en todas las peticiones
-        headers = None
-        key = os.environ.get("BINGX_API_KEY", "").strip()
-        sec = os.environ.get("BINGX_API_SECRET", "").strip()
-        if key and sec:
-            qs = "&".join("%s=%s" % (n, p[n]) for n in p)
-            p["signature"] = hmac.new(sec.encode(), qs.encode(), hashlib.sha256).hexdigest()
-            headers = {"X-BX-APIKEY": key}
-        j = http_get(cfg.base_url + path, p, headers=headers)
-        code = j.get("code") if isinstance(j, dict) else None
-        if code in (None, 0, "0"):
-            return j.get("data") if isinstance(j, dict) and "data" in j else j
-        if str(code) == "100410":                              # limite de peticiones
-            time.sleep(5 + 5 * k)
-            continue
-        raise RuntimeError("BingX codigo %s: %s" % (code, str(j.get("msg", ""))[:160]))
-    raise RuntimeError("BingX: limite de peticiones, reintentos agotados")
+# ---------------------------------------------------------------- BingX (swap USDT-M, API publica)
+class RateLimiter:
+    """Reparte las peticiones de todos los hilos a 'rps' por segundo."""
+
+    def __init__(self, rps):
+        self.interval = 1.0 / max(rps, 0.1)
+        self.lock = threading.Lock()
+        self.next = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            t = max(now, self.next)
+            self.next = t + self.interval
+        if t > now:
+            time.sleep(t - now)
 
 
-def norm_symbol(sym, exchange):
-    """BTCUSDT -> BTC-USDT en BingX; BTC-USDT -> BTCUSDT en Binance."""
-    sym = sym.strip().upper()
-    if exchange == "bingx" and "-" not in sym and sym.endswith("USDT") and len(sym) > 4:
-        return sym[:-4] + "-USDT"
-    if exchange == "binance":
-        return sym.replace("-", "")
-    return sym
+_BINGX_LIMITER = None
+_BINGX_LOCK = threading.Lock()
+_BINGX_KLINE_PATHS = ["/openApi/swap/v3/quote/klines", "/openApi/swap/v2/quote/klines"]
+_BINGX_KLINE_OK = None          # ruta de klines que ha funcionado (se recuerda tras el primer acierto)
 
 
-TRADFI_RE = re.compile(r"^(NCSK|NCCO|NCFX|NCSI|NCIN)|2USD$")
+def bingx_limiter(cfg):
+    global _BINGX_LIMITER
+    with _BINGX_LOCK:
+        if _BINGX_LIMITER is None:
+            _BINGX_LIMITER = RateLimiter(cfg.bingx_rps)
+        return _BINGX_LIMITER
 
 
-def is_tradfi(symbol):
-    """Perpetuos de acciones / materias primas / indices / forex de BingX (no son cripto 24/7)."""
-    return bool(TRADFI_RE.search(symbol.split("-")[0].upper()))
+def bingx_get(cfg, path, params=None, tries=4):
+    """GET publico a BingX. Devuelve el campo 'data'. Reintenta ante limites o fallos de red,
+    y usa el dominio .pro como respaldo del .com."""
+    lim = bingx_limiter(cfg)
+    bases = [cfg.bingx_url]
+    if cfg.bingx_url == "https://open-api.bingx.com":
+        bases.append("https://open-api.bingx.pro")
+    last = "sin respuesta"
+    for k in range(tries):
+        for base in bases:
+            lim.wait()
+            q = dict(params or {})
+            q["timestamp"] = int(time.time() * 1000)
+            try:
+                r = requests.get(base + path, params=q, timeout=15)
+            except requests.RequestException as e:
+                last = str(e)[:150]
+                continue
+            if r.status_code in (403, 451):
+                raise RuntimeError("BingX HTTP %d: la region del servidor esta bloqueada (403/451)" % r.status_code)
+            if r.status_code in (418, 429):
+                last = "HTTP %d (limite de peticiones)" % r.status_code
+                time.sleep(min(2.0 * (k + 1), 20))
+                break
+            try:
+                js = r.json()
+            except ValueError:
+                last = "respuesta no JSON (HTTP %d)" % r.status_code
+                continue
+            try:
+                code = int(js.get("code", 0))
+            except (TypeError, ValueError, AttributeError):
+                code = -1
+            if code == 0:
+                return js.get("data")
+            msg = str(js.get("msg", ""))
+            low = msg.lower()
+            if code == 100410 or "rate limit" in low or "too many" in low or "frequen" in low:
+                last = "limite de peticiones (%s)" % msg[:80]
+                time.sleep(min(2.0 * (k + 1), 20))
+                break
+            raise RuntimeError("BingX error %s: %s" % (code, msg[:200]))
+        else:                       # ningun dominio respondio bien: espera y reintenta
+            time.sleep(1 + k)
+    raise RuntimeError("BingX: %s" % last)
 
 
-def _bx_bar(x):
-    """Acepta velas como lista [t,o,h,l,c,v,...] o como dict {time,open,high,low,close,volume}."""
-    if isinstance(x, dict):
-        t, o, h, l, c, v = x["time"], x["open"], x["high"], x["low"], x["close"], x.get("volume", 0)
-    else:
-        t, o, h, l, c = x[0], x[1], x[2], x[3], x[4]
-        v = x[5] if len(x) > 5 else 0
-    t = int(float(t))
-    if t < 100_000_000_000:                                    # segundos -> ms
-        t *= 1000
-    c = float(c)
-    return {"t": t, "o": float(o), "h": float(h), "l": float(l), "c": c, "v": float(v) * c}   # v ~ USDT
-
-
-def _bx_bars(rows):
-    """Ordena ascendente y elimina duplicados (BingX no garantiza el orden)."""
+def parse_bingx_klines(rows, now_ms):
+    """Acepta velas como dict (open/high/low/close/volume/time) o como lista [t,o,h,l,c,v,...].
+    BingX puede devolverlas de la mas nueva a la mas antigua e incluye la vela en curso:
+    se ordenan y solo se devuelven las cerradas (t + 5 min <= now_ms)."""
     out = {}
-    for x in rows or []:
-        b = _bx_bar(x)
-        out[b["t"]] = b
+    for r in rows or []:
+        try:
+            if isinstance(r, dict):
+                t = int(r.get("time", r.get("openTime", r.get("t"))))
+                o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
+                v = _to_float(r.get("volume"))
+            else:
+                t = int(r[0])
+                o, h, l, c = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+                v = _to_float(r[5]) if len(r) > 5 else 0.0
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        if t + BAR_MS > now_ms:     # vela todavia abierta
+            continue
+        out[t] = {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
     return [out[t] for t in sorted(out)]
 
 
-def load_symbols_bingx(cfg, only=None):
-    meta, syms = {}, []
-    for c in bx_get(cfg, "/openApi/swap/v2/quote/contracts") or []:
-        sym = str(c.get("symbol", "")).upper()
-        if not sym.endswith("-USDT"):
-            continue
-        if str(c.get("status", 1)) in ("0", "5", "25"):          # offline / pre-lanzamiento / suspendido
-            continue
-        if str(c.get("apiStateOpen", "true")).lower() == "false":
-            continue
-        if not cfg.include_tradfi and is_tradfi(sym):
-            continue
-        pp = int(float(c.get("pricePrecision", 4) or 4))
-        qp = int(float(c.get("quantityPrecision", 0) or 0))
-        meta[sym] = {"tick": 10.0 ** -pp, "step": 10.0 ** -qp}
-        syms.append(sym)
+def parse_bingx_contracts(contracts, tickers, cfg, only=None):
+    """Filtra los contratos USDT activos y devuelve (symbols, meta) ordenados por volumen."""
     vols = {}
-    try:
-        for x in bx_get(cfg, "/openApi/swap/v2/quote/ticker") or []:
-            q = x.get("quoteVolume")
-            if q in (None, ""):
-                q = float(x.get("volume", 0) or 0) * float(x.get("lastPrice", 0) or 0)
-            vols[str(x["symbol"]).upper()] = float(q)
-    except Exception as e:
-        log.warning("sin volumen 24h (%s): no se filtra por volumen", e)
-    if vols and max(vols.values()) <= 0:
-        log.warning("el ticker no trae volumen: no se filtra por volumen")
-        vols = {}
-    excl = {norm_symbol(x, "bingx") for x in cfg.exclude_symbols}
-    if only:
-        only = {norm_symbol(x, "bingx") for x in only}
-        syms = [x for x in syms if x in only]
-    elif vols:
-        syms = [x for x in syms if vols.get(x, 0.0) >= cfg.min_quote_volume and x not in excl]
-    else:
-        syms = [x for x in syms if x not in excl]
+    for t in tickers or []:
+        try:
+            vols[t["symbol"]] = _to_float(t.get("quoteVolume"))
+        except (KeyError, AttributeError, TypeError):
+            continue
+    minv = cfg.min_quote_volume if cfg.min_quote_volume >= 0 else 1_000_000.0
+    excl = {norm_sym(x) for x in cfg.exclude_symbols}
+    only_n = {norm_sym(x) for x in only} if only else None
+    use_vol = bool(vols)
+    if not use_vol and minv > 0 and only_n is None:
+        log.warning("BingX: sin datos de volumen 24h; se ignora MIN_QUOTE_VOLUME")
+    syms, meta = [], {}
+    for c in contracts or []:
+        sym = str(c.get("symbol", ""))
+        if not sym.endswith("-USDT") or str(c.get("status", "1")) != "1":
+            continue
+        if not cfg.include_non_crypto and sym.startswith("NC") and "2USD" in sym:
+            continue                # acciones / materias primas / forex tokenizados
+        n = norm_sym(sym)
+        if n in excl:
+            continue
+        if only_n is not None:
+            if n not in only_n:
+                continue
+        elif use_vol and vols.get(sym, 0.0) < minv:
+            continue
+        pp = _to_int(c.get("pricePrecision"))
+        qp = _to_int(c.get("quantityPrecision"))
+        meta[sym] = {
+            "tick": 10.0 ** (-pp) if pp is not None and pp >= 0 else 0.0001,
+            "step": 10.0 ** (-qp) if qp is not None and qp >= 0 else 0.0,
+            "min_qty": _to_float(c.get("tradeMinQuantity")),
+        }
+        syms.append(sym)
     syms.sort(key=lambda x: -vols.get(x, 0.0))
     if cfg.max_symbols:
         syms = syms[:cfg.max_symbols]
     return syms, meta
 
 
-def fetch_bars_bingx(cfg, symbol):
-    rows = bx_get(cfg, "/openApi/swap/v3/quote/klines",
-                  {"symbol": symbol, "interval": cfg.interval, "limit": cfg.klines_limit})
-    now_ms = int(time.time() * 1000)
-    return [b for b in _bx_bars(rows) if b["t"] + BAR_MS <= now_ms]      # solo velas cerradas
+def _bingx_klines(cfg, symbol, interval, limit, extra=None):
+    """Pide velas probando la ruta v3 y, si no funciona, la v2. Devuelve las filas crudas."""
+    global _BINGX_KLINE_OK
+    paths = [_BINGX_KLINE_OK] if _BINGX_KLINE_OK else list(_BINGX_KLINE_PATHS)
+    last_err = None
+    for path in paths:
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        params.update(extra or {})
+        try:
+            rows = bingx_get(cfg, path, params)
+        except RuntimeError as e:
+            if "403/451" in str(e):
+                raise
+            last_err = e
+            continue
+        if rows:
+            _BINGX_KLINE_OK = path
+            return rows
+        last_err = RuntimeError("BingX: sin velas para %s en %s" % (symbol, path))
+    raise last_err or RuntimeError("BingX: no se pudieron leer velas de %s" % symbol)
 
 
-def fetch_history_bingx(cfg, symbol, days):
-    """Pagina hacia atras con endTime (1440 velas por peticion)."""
-    end = int(time.time() * 1000)
-    start = end - int((days + 1) * 86_400_000)
-    out, cur_end, prev_oldest = {}, end, None
-    for _ in range(60):
-        bars = _bx_bars(bx_get(cfg, "/openApi/swap/v3/quote/klines",
-                               {"symbol": symbol, "interval": cfg.interval, "endTime": cur_end, "limit": 1440}))
+class BingXAPI:
+    """BingX perpetuos USDT-M (API publica, sin clave). Simbolos tipo BTC-USDT."""
+    name = "bingx"
+    label = "BingX"
+    btc_symbol = "BTC-USDT"
+
+    @staticmethod
+    def load_symbols(cfg, only=None):
+        contracts = bingx_get(cfg, "/openApi/swap/v2/quote/contracts")
+        try:
+            tickers = bingx_get(cfg, "/openApi/swap/v2/quote/ticker")
+        except RuntimeError as e:
+            log.warning("BingX: no se pudo leer el volumen 24h (%s)", e)
+            tickers = []
+        if isinstance(tickers, dict):
+            tickers = [tickers]
+        return parse_bingx_contracts(contracts, tickers, cfg, only)
+
+    @staticmethod
+    def fetch_bars(cfg, symbol):
+        rows = _bingx_klines(cfg, symbol, cfg.interval, cfg.klines_limit)
+        bars = parse_bingx_klines(rows, int(time.time() * 1000))
         if not bars:
-            break
-        for b in bars:
-            out[b["t"]] = b
-        oldest = bars[0]["t"]
-        if oldest <= start or (prev_oldest is not None and oldest >= prev_oldest):
-            break
-        prev_oldest, cur_end = oldest, oldest - 1
-    return [out[t] for t in sorted(out) if t >= start and t + BAR_MS <= end]
+            raise RuntimeError("BingX: sin velas cerradas para %s" % symbol)
+        return bars
+
+    @staticmethod
+    def fetch_history(cfg, symbol, days):
+        """Historico de 5m en ventanas de <=1440 velas (asi el orden/limite de la respuesta no importa)."""
+        end = int(time.time() * 1000)
+        cur = end - int((days + 1) * 86_400_000)
+        out = {}
+        while cur < end:
+            win_end = min(cur + 1400 * BAR_MS, end)
+            try:
+                rows = _bingx_klines(cfg, symbol, cfg.interval, 1440, {"startTime": cur, "endTime": win_end})
+            except RuntimeError as e:
+                if "403/451" in str(e):
+                    raise
+                rows = []
+            for b in parse_bingx_klines(rows, end):
+                out[b["t"]] = b
+            cur = win_end
+        return [out[t] for t in sorted(out)]
+
+    @staticmethod
+    def last_price(cfg, symbol):
+        """Ultimo precio = cierre de la vela de 1m en curso."""
+        rows = _bingx_klines(cfg, symbol, "1m", 2)
+        bars = parse_bingx_klines(rows, 10 ** 18)           # incluye la vela abierta
+        if not bars:
+            raise RuntimeError("BingX: sin precio para %s" % symbol)
+        return bars[-1]["c"]
+
+    @staticmethod
+    def buttons(symbol):
+        return [
+            {"text": "📈 BingX", "url": "https://bingx.com/en/perpetual/%s" % symbol},
+            {"text": "📊 TradingView", "url": "https://www.tradingview.com/chart/?symbol=BINGX%%3A%s.P" % norm_sym(symbol)},
+        ]
 
 
-# ---- Binance ----
-def load_symbols_binance(cfg, only=None):
-    """Devuelve (symbols, meta) con meta[symbol] = {"tick": .., "step": ..}."""
-    info = http_get(cfg.base_url + "/fapi/v1/exchangeInfo")
-    meta, syms = {}, []
-    for s in info["symbols"]:
-        if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT":
-            m = {"tick": 0.0001, "step": 0.0}
-            for f in s.get("filters", []):
-                if f.get("filterType") == "PRICE_FILTER":
-                    m["tick"] = float(f["tickSize"])
-                elif f.get("filterType") == "LOT_SIZE":
-                    m["step"] = float(f["stepSize"])
-            meta[s["symbol"]] = m
-            syms.append(s["symbol"])
-    vols = {x["symbol"]: float(x["quoteVolume"]) for x in http_get(cfg.base_url + "/fapi/v1/ticker/24hr")}
-    if only:
-        syms = [s for s in syms if s in only]
-    else:
-        syms = [s for s in syms if vols.get(s, 0.0) >= cfg.min_quote_volume and s not in cfg.exclude_symbols]
-    syms.sort(key=lambda s: -vols.get(s, 0.0))
-    if cfg.max_symbols:
-        syms = syms[:cfg.max_symbols]
-    return syms, meta
+EXCHANGES = {"bingx": BingXAPI, "binance": BinanceAPI}
 
 
-def _row_to_bar(r):
-    return {"t": int(r[0]), "o": float(r[1]), "h": float(r[2]), "l": float(r[3]), "c": float(r[4]),
-            "v": float(r[7])}                              # v = volumen en USDT
+def active_exchanges(cfg):
+    return ["bingx", "binance"] if cfg.exchange == "both" else [cfg.exchange]
 
 
-def fetch_bars_binance(cfg, symbol):
-    rows = http_get(cfg.base_url + "/fapi/v1/klines",
-                    {"symbol": symbol, "interval": cfg.interval, "limit": cfg.klines_limit})
-    now_ms = int(time.time() * 1000)
-    return [_row_to_bar(r) for r in rows if int(r[6]) < now_ms]   # solo velas cerradas
-
-
-def fetch_history_binance(cfg, symbol, days):
-    end = int(time.time() * 1000)
-    cur = end - int((days + 1) * 86_400_000)
-    out = []
-    while cur < end:
-        rows = http_get(cfg.base_url + "/fapi/v1/klines",
-                        {"symbol": symbol, "interval": cfg.interval, "startTime": cur, "limit": 1500})
-        if not rows:
-            break
-        out.extend(_row_to_bar(r) for r in rows)
-        nxt = int(rows[-1][0]) + BAR_MS
-        if nxt <= cur or len(rows) < 1500:
-            break
-        cur = nxt
-        time.sleep(0.2)
-    return [b for b in out if b["t"] + BAR_MS <= end]
-
-
-# ---- seleccion por exchange ----
-def load_symbols(cfg, only=None):
-    return (load_symbols_bingx if cfg.exchange == "bingx" else load_symbols_binance)(cfg, only)
-
-
-def fetch_bars(cfg, symbol):
-    return (fetch_bars_bingx if cfg.exchange == "bingx" else fetch_bars_binance)(cfg, symbol)
-
-
-def fetch_history(cfg, symbol, days):
-    """Velas de 5m cerradas de los ultimos 'days' dias (+1 dia de calentamiento para la EMA)."""
-    return (fetch_history_bingx if cfg.exchange == "bingx" else fetch_history_binance)(cfg, symbol, days)
-
-
-def scan_all(cfg, symbols, meta, funnel=None, btc=None):
+def scan_all(cfg, ex, symbols, meta, funnel=None, btc=None):
+    """Descarga y analiza las monedas de un exchange. 'btc' = tendencia 1H de BTC (None = sin dato)."""
     found = []
-    stale = 0
-    exp_t = int(time.time() * 1000) // BAR_MS * BAR_MS - BAR_MS      # ultima vela de 5m que ya deberia estar cerrada
-    with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
-        futs = {ex.submit(fetch_bars, cfg, s): s for s in symbols}
+    with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
+        futs = {pool.submit(ex.fetch_bars, cfg, x): x for x in symbols}
         for f in as_completed(futs):
             sym = futs[f]
             try:
                 m = meta.get(sym, {})
-                bars = f.result()
-                if not bars or bars[-1]["t"] < exp_t:                # el exchange aun no publica la vela: no operar con datos viejos
-                    stale += 1
-                    continue
-                for s in analyze(sym, bars, m.get("tick", 0.0001), cfg, funnel, btc):
-                    s["step"] = m.get("step", 0.0)
-                    found.append(s)
+                ref = None if norm_sym(sym) == "BTCUSDT" else btc
+                for sg in analyze(sym, f.result(), m.get("tick", 0.0001), cfg, funnel, ref=ref):
+                    sg["exchange"] = ex.name
+                    sg["step"] = m.get("step", 0.0)
+                    sg["min_qty"] = m.get("min_qty", 0.0)
+                    found.append(sg)
             except Exception as e:  # una moneda con error no debe parar el escaneo
-                log.warning("%s: %s", sym, e)
-    if stale:
-        log.info("%d de %d monedas sin la ultima vela cerrada todavia (se omiten en este escaneo)", stale, len(symbols))
+                log.warning("%s %s: %s", ex.label, sym, e)
     return found
 
 
@@ -1083,7 +1158,7 @@ def new_stats():
 def load_state():
     base = {"sent": {}, "active": {}, "last_symbol": {}, "daily": {"date": "", "n": 0},
             "stats": {}, "totals": new_stats(), "last_summary": "",
-            "funnel": {}, "last_hb": 0.0, "hb_n": 0, "tuned": {}, "edge": None, "last_tune": 0.0}
+            "funnel": {}, "last_hb": 0.0, "hb_n": 0}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
@@ -1124,7 +1199,7 @@ def make_active(s, ids, now):
     keys = ("symbol", "side", "entry", "sl", "tp1", "tp2", "tick", "entry_t", "score")
     a = {k: s[k] for k in keys}
     a.update({"sl_now": s["sl"], "last_t": s["entry_t"], "created": now, "status": "open", "msg": ids,
-              "fee_r": s.get("fee_r", 0.0), "last_c": s["entry"]})
+              "fee_r": s.get("fee_r", 0.0), "last_c": s["entry"], "exchange": s.get("exchange", "binance")})
     return a
 
 
@@ -1182,7 +1257,7 @@ def track_active(cfg, st):
     for aid in list(active):
         sig = active[aid]
         try:
-            bars = fetch_bars(cfg, sig["symbol"])
+            bars = EXCHANGES[sig.get("exchange", "binance")].fetch_bars(cfg, sig["symbol"])
         except Exception as e:
             log.warning("seguimiento %s: %s", sig["symbol"], e)
             continue
@@ -1219,35 +1294,64 @@ def maybe_summary(cfg, st):
 # ============================================================================
 #  BUCLE PRINCIPAL
 # ============================================================================
-def run_once(cfg, symbols, meta, dry_run):
+def stale_reason(s, price):
+    """None si la senal sigue vigente al precio actual; texto si ya no conviene entrar."""
+    sgn = 1 if s["side"] == "LONG" else -1
+    if (price - s["max_entry"]) * sgn > 0:
+        return "el precio ya se alejo de la entrada (%.6g vs limite %.6g)" % (price, s["max_entry"])
+    if (price - s["sl"]) * sgn <= 0:
+        return "el precio ya toco el SL (%.6g)" % s["sl"]
+    return None
+
+
+def open_blocked(st, side, cfg):
+    """Limite de exposicion: devuelve el motivo si ya hay demasiadas senales abiertas."""
+    act = [a for a in st["active"].values() if a.get("status") != "closed"]
+    if cfg.max_open_total and len(act) >= cfg.max_open_total:
+        return "ya hay %d señales abiertas (MAX_OPEN_TOTAL)" % len(act)
+    n = sum(1 for a in act if a["side"] == side)
+    if cfg.max_open_per_side and n >= cfg.max_open_per_side:
+        return "ya hay %d %s abiertas (MAX_OPEN_PER_SIDE)" % (n, side)
+    return None
+
+
+def btc_trend_now(cfg, ex):
+    """Tendencia 1H de BTC en este exchange (+1/-1/0), o None si no se pudo calcular."""
+    try:
+        return trend_series(ex.fetch_bars(cfg, ex.btc_symbol), cfg)[-1]
+    except Exception as e:
+        log.warning("filtro BTC desactivado en este escaneo (%s)", e)
+        return None
+
+
+def run_once(cfg, markets, dry_run):
     st = load_state()
-    if cfg.autotune and not dry_run:
-        apply_tuned(cfg, st.get("tuned"))                      # parametros validados por el ultimo autoajuste
-        RUNTIME["edge"] = st.get("edge")
-        absorb_tune(cfg, st)
-        maybe_launch_autotune(cfg, st, symbols, meta)
     if cfg.track_signals and not dry_run:
         track_active(cfg, st)
     funnel = {}
-    btc = None
-    if cfg.btc_filter:
-        try:
-            btc = btc_trend_map(fetch_bars(cfg, norm_symbol("BTCUSDT", cfg.exchange)), cfg.trend_ema_bars)
-        except Exception as e:
-            log.warning("filtro BTC desactivado en este escaneo (sin datos de BTC): %s", e)
-    sigs = scan_all(cfg, symbols, meta, funnel, btc)
-    sigs = [s for s in sigs if s["score"] >= cfg.min_score
-            and (cfg.max_risk_pct <= 0 or s["risk_pct"] <= cfg.max_risk_pct)]
-    sigs.sort(key=lambda s: (-s["score"], -s.get("rel_vol", 0.0), s["risk_pct"]))
-    sent_side = {"LONG": 0, "SHORT": 0}
+    t0 = time.time()
+    sigs, total = [], 0
+    for exname, (symbols, meta) in markets.items():
+        ex = EXCHANGES[exname]
+        total += len(symbols)
+        btc = btc_trend_now(cfg, ex) if cfg.btc_filter else None
+        sigs += scan_all(cfg, ex, symbols, meta, funnel, btc)
+    dur = time.time() - t0
+    if dur > 240:
+        log.warning("el escaneo tardo %.0f s (casi un ciclo de 5 min): sube BINGX_RPS/WORKERS, "
+                    "baja MAX_SYMBOLS o sube MIN_QUOTE_VOLUME", dur)
+    sigs = [x for x in sigs if x["score"] >= cfg.min_score
+            and (cfg.max_risk_pct <= 0 or x["risk_pct"] <= cfg.max_risk_pct)]
+    sigs.sort(key=lambda x: (-x["score"], x["risk_pct"]))
 
     now = time.time()
     today = today_ny()
     if st["daily"].get("date") != today:
         st["daily"] = {"date": today, "n": 0}
-    n_sent = 0
+    n_sent = n_stale = n_blocked = 0
     for s in sigs:
-        key = "%s|%s|%s" % (s["symbol"], s["cycle_start_ms"], s["side"])
+        key = "%s|%s|%s|%s" % (s["exchange"], s["symbol"], s["cycle_start_ms"], s["side"])
+        coin = norm_sym(s["symbol"])                       # misma moneda en distintos exchanges = 1 cooldown
         if key in st["sent"]:
             continue
         if n_sent >= cfg.max_signals_per_scan:
@@ -1255,33 +1359,36 @@ def run_once(cfg, symbols, meta, dry_run):
         if cfg.max_signals_per_day and st["daily"]["n"] >= cfg.max_signals_per_day:
             log.info("limite diario de senales alcanzado (%d)", cfg.max_signals_per_day)
             break
-        if now - st["last_symbol"].get(s["symbol"], 0) < cfg.symbol_cooldown_min * 60:
+        if now - st["last_symbol"].get(coin, 0) < cfg.symbol_cooldown_min * 60:
             continue
-        if cfg.max_open_per_side:
-            # con seguimiento, "active" ya incluye las enviadas en este escaneo; sin el, solo se cuentan las de este escaneo
-            same = (sum(1 for a in st["active"].values() if a.get("side") == s["side"])
-                    if cfg.track_signals else sent_side[s["side"]])
-            if same >= cfg.max_open_per_side:
-                _bump(funnel, "only:concentracion")
+        if cfg.track_signals:
+            why = open_blocked(st, s["side"], cfg)
+            if why:
+                n_blocked += 1
+                log.info("no se avisa %s %s: %s", s["side"], s["symbol"], why)
                 continue
-        if cfg.max_slip_r > 0:
-            ok_liq, info = exec_check(cfg, s)
-            if ok_liq is False:
-                log.info("%s %s descartada por liquidez (%s)", s["side"], s["symbol"],
-                         "libro insuficiente" if info["impact"] == float("inf") else "coste %.2fR" % info["cost_r"])
-                _bump(funnel, "only:liquidez")
-                continue
-            s["liq"] = info
-        log.info("SEÑAL %s %s (%d/%d)", s["side"], s["symbol"], s["score"], SCORE_MAX)
-        ids = emit(format_message(s, cfg), dry_run, buttons=buttons_for(s["symbol"], cfg.exchange))
+        if cfg.fresh_check:
+            try:
+                price = EXCHANGES[s["exchange"]].last_price(cfg, s["symbol"])
+            except Exception as e:
+                price = None
+                log.debug("sin precio actual de %s: %s", s["symbol"], e)
+            if price:
+                reason = stale_reason(s, price)
+                if reason:
+                    n_stale += 1
+                    log.info("descartada %s %s: %s", s["side"], s["symbol"], reason)
+                    continue
+                s["price_now"] = price
+        log.info("SEÑAL %s %s %s (%d/%d)", s["side"], s["symbol"], s["exchange"], s["score"], SCORE_MAX)
+        ids = emit(format_message(s, cfg), dry_run, buttons=buttons_for(s))
         if ids is None:
             continue
         n_sent += 1
-        sent_side[s["side"]] += 1
         if dry_run:
             continue
         st["sent"][key] = now
-        st["last_symbol"][s["symbol"]] = now
+        st["last_symbol"][coin] = now
         st["daily"]["n"] += 1
         st["hb_n"] = st.get("hb_n", 0) + 1
         bump_stats(st, "n")
@@ -1293,69 +1400,10 @@ def run_once(cfg, symbols, meta, dry_run):
         for k, v in funnel.items():
             _bump(st["funnel"], k, v)
         maybe_summary(cfg, st)
-        maybe_heartbeat(cfg, st, len(symbols))
+        maybe_heartbeat(cfg, st, total)
         save_state(st)
-    log.info("escaneo terminado: %d monedas, %d señales nuevas, %d en seguimiento",
-             len(symbols), n_sent, len(st["active"]))
-
-
-# ---- liquidez real en el momento de la señal (libro de ordenes) ----
-DEFAULT_NOTIONAL = 1000.0
-
-
-def parse_book(raw):
-    bids = sorted(((float(x[0]), float(x[1])) for x in raw.get("bids", [])), reverse=True)
-    asks = sorted((float(x[0]), float(x[1])) for x in raw.get("asks", []))
-    return bids, asks
-
-
-def book_cost(bids, asks, side, notional):
-    """(spread_pct, impacto_pct): impacto = precio medio de ejecucion de 'notional' USDT frente al punto medio
-    (incluye medio spread). impacto None si el libro consultado no alcanza para llenar la orden."""
-    if not bids or not asks:
-        return None
-    bb, ba = bids[0][0], asks[0][0]
-    mid = (bb + ba) / 2.0
-    spread = (ba - bb) / mid * 100.0
-    need, got, paid = notional / mid, 0.0, 0.0
-    for price, qty in (asks if side == "LONG" else bids):
-        take = min(qty, need - got)
-        got += take
-        paid += take * price
-        if got >= need - 1e-12:
-            break
-    if got < need * 0.999:
-        return spread, None
-    return spread, abs(paid / got - mid) / mid * 100.0
-
-
-def fetch_book(cfg, symbol):
-    if cfg.exchange == "bingx":
-        for lim in (50, 20):                                   # si el limite no es valido, reintenta con otro
-            try:
-                return parse_book(bx_get(cfg, "/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": lim}))
-            except Exception as e:
-                err = e
-        raise err
-    return parse_book(http_get(cfg.base_url + "/fapi/v1/depth", {"symbol": symbol, "limit": 50}))
-
-
-def exec_check(cfg, s):
-    """(ok, info). ok None = no se pudo verificar (no bloquea). Mide el coste real de entrar y salir al tamano de tu orden."""
-    ps = position_size(s, cfg)
-    notional = ps["notional"] if ps and ps.get("notional") else DEFAULT_NOTIONAL
-    try:
-        bc = book_cost(*fetch_book(cfg, s["symbol"]), s["side"], notional)
-    except Exception as e:
-        log.warning("libro de %s no disponible: %s", s["symbol"], e)
-        return None, None
-    if bc is None:
-        return None, None
-    spread, impact = bc
-    if impact is None:
-        return False, {"spread": spread, "impact": float("inf"), "notional": notional, "cost_r": float("inf")}
-    c_r = 2.0 * impact / s["risk_pct"]
-    return c_r <= cfg.max_slip_r, {"spread": spread, "impact": impact, "notional": notional, "cost_r": c_r}
+    log.info("escaneo terminado: %d monedas en %.0f s, %d señales nuevas (%d vencidas por precio, %d por exposicion), "
+             "%d en seguimiento", total, dur, n_sent, n_stale, n_blocked, len(st["active"]))
 
 
 def funnel_text(f, top=4):
@@ -1385,8 +1433,7 @@ def maybe_heartbeat(cfg, st, n_symbols):
         return
     f = st.get("funnel", {})
     only = sorted(((k[5:], v) for k, v in f.items() if k.startswith("only:")), key=lambda x: -x[1])[:3]
-    msg = ["💓 <b>QT Scanner activo</b> · %s" % cfg.exchange.upper(),
-           "Config: " + describe_key(cfg_key(cfg)),
+    msg = ["💓 <b>QT Scanner activo</b>",
            "Monedas: %d | senales desde el ultimo aviso: %d | en seguimiento: %d" % (
                n_symbols, st.get("hb_n", 0), len(st["active"]))]
     if only:
@@ -1415,56 +1462,123 @@ def notify(key, text, dry_run, every=3600):
         log.error("no se pudo avisar por Telegram: %s", e)
 
 
-def start_text(cfg, n):
+def start_text(cfg, markets):
     acct = ("cuenta %.0f USDT, riesgo %.1f%%" % (cfg.account_size, cfg.risk_per_trade_pct)
             if cfg.account_size > 0 else "calculadora de posicion desactivada (falta ACCOUNT_SIZE)")
-    return ("🚀 <b>QT Scanner iniciado</b> · %s\n"
-            "Monedas: %d | sesiones: %s\n"
+    exs = ", ".join("%s (%d monedas)" % (EXCHANGES[n].label, len(v[0])) for n, v in markets.items())
+    filt = [t for t, on in (("MSS", cfg.require_mss), ("BTC 1H", cfg.btc_filter), ("tendencia 1H", cfg.trend_filter)) if on]
+    return ("🚀 <b>QT Scanner iniciado</b>\n"
+            "Exchange: %s\n"
+            "Sesiones: %s\n"
             "Sesgo: %s | cadena: %s | puntuacion minima: %d/%d\n"
+            "Filtros extra: %s\n"
             "RR %.1f | TP1 %.1fR (%.0f%%) | riesgo max SL %.1f%%\n"
             "%s\n"
-            "Seguimiento: %s | resumen diario: %s | autoajuste: %s") % (
-        cfg.exchange.upper(), n, ", ".join(SESSION_NAMES[i] for i in cfg.sessions), cfg.bias_mode,
+            "Seguimiento: %s | resumen diario: %s") % (
+        exs, ", ".join(SESSION_NAMES[i] for i in cfg.sessions), cfg.bias_mode,
         "obligatoria" if cfg.require_chain else "opcional", cfg.min_score, SCORE_MAX,
-        cfg.rr, cfg.partial_r, cfg.partial_pct, cfg.max_risk_pct, acct,
+        ", ".join(filt) or "ninguno", cfg.rr, cfg.partial_r, cfg.partial_pct, cfg.max_risk_pct, acct,
         "on" if cfg.track_signals else "off",
-        ("%d:00 NY" % cfg.daily_summary_hour) if cfg.daily_summary_hour >= 0 else "off",
-        ("cada %.0f h (%s)" % (cfg.autotune_hours, cfg.autotune_mode)) if cfg.autotune else "off")
+        ("%d:00 NY" % cfg.daily_summary_hour) if cfg.daily_summary_hour >= 0 else "off")
+
+
+def load_markets(cfg, only, dry_run, old=None):
+    """Carga la lista de monedas de cada exchange activo. Si uno falla, conserva la lista anterior."""
+    markets = {}
+    for name in active_exchanges(cfg):
+        ex = EXCHANGES[name]
+        try:
+            symbols, meta = ex.load_symbols(cfg, only)
+            markets[name] = (symbols, meta)
+            log.info("%s: %d monedas a escanear", ex.label, len(symbols))
+        except Exception as e:
+            log.error("%s: no se pudo cargar la lista de monedas: %s", ex.label, e)
+            if old and name in old:
+                markets[name] = old[name]
+            hint = ""
+            if "451" in str(e) or "403" in str(e):
+                hint = "\nEl exchange bloquea la region del servidor: cambia la region en Railway (p. ej. Europa)."
+            notify("load_" + name, "⚠️ QT Scanner: no se pudo cargar %s: %s%s" % (ex.label, str(e)[:200], hint), dry_run)
+    if not markets:
+        raise RuntimeError("no se pudo cargar ningun exchange")
+    return markets
 
 
 def loop(cfg, dry_run, only):
-    symbols, meta, last_load = [], {}, 0
+    markets, last_load = {}, 0
     announced = False
     while True:
         try:
-            if not symbols or time.time() - last_load > 1800:      # refresca la lista cada 30 min
-                symbols, meta = load_symbols(cfg, only)
+            if not markets or time.time() - last_load > 1800:      # refresca la lista cada 30 min
+                markets = load_markets(cfg, only, dry_run, markets)
                 last_load = time.time()
-                log.info("%d monedas a escanear", len(symbols))
                 if not announced:
                     announced = True
-                    notify("start", start_text(cfg, len(symbols)), dry_run, every=0)
-            t_scan = time.time()
-            run_once(cfg, symbols, meta, dry_run)
-            took = time.time() - t_scan
-            if took > 240:
-                log.warning("el escaneo tardo %.0fs (>4 min): reduce MAX_SYMBOLS o sube MIN_QUOTE_VOLUME", took)
+                    notify("start", start_text(cfg, markets), dry_run, every=0)
+            run_once(cfg, markets, dry_run)
         except Exception as e:
             log.error("error en el escaneo: %s", e)
             hint = ""
             if "451" in str(e) or "403" in str(e):
-                hint = "\n%s bloquea la region del servidor: cambia la region en Railway (p. ej. Europa)." % cfg.exchange.capitalize()
-            elif "BingX codigo" in str(e):
-                hint = "\nSi el codigo habla de firma/timestamp, define BINGX_API_KEY y BINGX_API_SECRET (clave de solo lectura)."
+                hint = "\nEl exchange bloquea la region del servidor: cambia la region en Railway (p. ej. Europa)."
             notify("scan_error", "⚠️ QT Scanner: error en el escaneo: %s%s" % (str(e)[:200], hint), dry_run)
         now = time.time()
-        nxt = (int(now // 300) + 1) * 300 + 6                      # 6 s despues del cierre de la vela de 5m
+        nxt = (int(now // 300) + 1) * 300 + cfg.scan_delay_sec     # justo despues del cierre de la vela de 5m
         time.sleep(max(1, nxt - now))
+
+
+def check_exchange(cfg, only):
+    """Diagnostico: --check. Comprueba monedas, precision, velas y precio actual de cada exchange activo."""
+    for name in active_exchanges(cfg):
+        ex = EXCHANGES[name]
+        print("== %s ==" % ex.label)
+        symbols, meta = ex.load_symbols(cfg, only)
+        print("monedas que pasan los filtros: %d" % len(symbols))
+        for sym in symbols[:5]:
+            m = meta[sym]
+            print("  %-22s tick=%s step=%s min_qty=%s" % (sym, m["tick"], m["step"], m.get("min_qty")))
+        if not symbols:
+            continue
+        t0 = time.time()
+        bars = ex.fetch_bars(cfg, symbols[0])
+        print("%s: %d velas cerradas de 5m en %.1f s" % (symbols[0], len(bars), time.time() - t0))
+        for b in bars[-3:]:
+            print("   %s  o=%s h=%s l=%s c=%s v=%s" % (
+                datetime.fromtimestamp(b["t"] / 1000.0, tz=NY).strftime("%Y-%m-%d %H:%M NY"),
+                b["o"], b["h"], b["l"], b["c"], b.get("v")))
+        age = time.time() - (bars[-1]["t"] + BAR_MS) / 1000.0
+        print("la ultima vela cerro hace %.0f s (debe ser < 300 s)" % age)
+        try:
+            print("precio actual de %s: %s" % (symbols[0], ex.last_price(cfg, symbols[0])))
+        except Exception as e:
+            print("precio actual: FALLO (%s) -> FRESH_CHECK se omitira" % e)
+        if name == "bingx":
+            print("tiempo estimado de un escaneo completo: ~%.0f s (%d monedas a %.1f peticiones/s)" % (
+                len(symbols) / cfg.bingx_rps, len(symbols), cfg.bingx_rps))
 
 
 # ============================================================================
 #  BACKTEST (historico de Binance, comisiones incluidas)
 # ============================================================================
+def binance_history(cfg, symbol, days):
+    """Velas de 5m cerradas de los ultimos 'days' dias (+1 dia de calentamiento para la EMA)."""
+    end = int(time.time() * 1000)
+    cur = end - int((days + 1) * 86_400_000)
+    out = []
+    while cur < end:
+        rows = http_get(cfg.base_url + "/fapi/v1/klines",
+                        {"symbol": symbol, "interval": cfg.interval, "startTime": cur, "limit": 1500})
+        if not rows:
+            break
+        out.extend(_row_to_bar(r) for r in rows)
+        nxt = int(rows[-1][0]) + BAR_MS
+        if nxt <= cur or len(rows) < 1500:
+            break
+        cur = nxt
+        time.sleep(0.2)
+    return [b for b in out if b["t"] + BAR_MS <= end]
+
+
 def simulate_trade(s, future, cfg):
     """Gestion del trade con velas de 5m (SL primero si coinciden). Devuelve (tipo, R neto de comisiones)."""
     risk = abs(s["entry"] - s["sl"])
@@ -1476,7 +1590,7 @@ def simulate_trade(s, future, cfg):
     if a["status"] != "closed":
         ev += evaluate_signal(a, [], cfg, cfg.track_hours * 3600 + 1.0)
     kind, r = [e for e in ev if e[0] in STAT_FIELD][-1]
-    fee_r = cost_r(cfg, s["entry"], risk)
+    fee_r = 2.0 * (cfg.fee_pct + cfg.slippage_pct) / (risk / s["entry"] * 100.0)
     return kind, r - fee_r
 
 
@@ -1498,13 +1612,14 @@ def trade_stats(rs):
             "ci": 1.96 * sd / math.sqrt(n), "mdd": mdd}
 
 
-def backtest_variant(cfg, data, meta, preps, warm_t, funnel=None):
+def backtest_variant(cfg, data, meta, preps, warm_t, funnel=None, ref_map=None):
     """Genera los trades simulados de una configuracion sobre el historico descargado."""
     trades = []
     horizon = int(cfg.track_hours * 12)
     for sym, bars in data.items():
         tick = meta.get(sym, {}).get("tick", 0.0001)
-        sigs = scan_series(sym, bars, tick, cfg, only_last=False, funnel=funnel, prep=preps[sym])
+        ref = None if norm_sym(sym) == "BTCUSDT" else ref_map
+        sigs = scan_series(sym, bars, tick, cfg, only_last=False, funnel=funnel, prep=preps[sym], ref=ref)
         sigs = [s for s in sigs if s["entry_t"] >= warm_t and s["score"] >= cfg.min_score
                 and s["bar_i"] + horizon < len(bars)]
         sigs.sort(key=lambda s: s["entry_t"])
@@ -1546,6 +1661,12 @@ VARIANTS = [
     ("sin cadena + volumen relativo >= 1.5", {"require_chain": False, "min_rel_vol": 1.5}),
     ("sin cadena + score >= 4", {"require_chain": False, "min_score": 4}),
     ("sin cadena + score >= 5", {"require_chain": False, "min_score": 5}),
+    ("sin cadena + ruptura de estructura (MSS)", {"require_chain": False, "require_mss": True}),
+    ("sin cadena + filtro BTC 1H", {"require_chain": False, "btc_filter": True}),
+    ("sin cadena + MSS + BTC", {"require_chain": False, "require_mss": True, "btc_filter": True}),
+    ("sin cadena + MSS + tendencia 1H", {"require_chain": False, "require_mss": True, "trend_filter": True}),
+    ("sin cadena + MSS + BTC + tendencia + vol 1.5",
+     {"require_chain": False, "require_mss": True, "btc_filter": True, "trend_filter": True, "min_rel_vol": 1.5}),
 ]
 
 TARGET_VARIANTS = [
@@ -1569,14 +1690,43 @@ def _group(trades, key, label):
         print("  %-10s n=%-4d win %5.1f%%  R neto %+.2f  suma %+.1f" % (k, st["n"], st["win"], st["avg"], st["sum"]))
 
 
+def walk_forward_text(rows, mid_t, min_n=30):
+    """Validacion fuera de muestra: elige la variante con mejor limite inferior del IC en la 1a mitad
+    y muestra como le fue en la 2a mitad, que no se uso para elegirla."""
+    best = None
+    for name, tr in rows:
+        s1 = trade_stats([t["r"] for t in tr if t["t"] < mid_t])
+        if s1 is None or s1["n"] < min_n:
+            continue
+        score = s1["avg"] - s1["ci"]
+        if best is None or score > best[0]:
+            best = (score, name, s1, tr)
+    if best is None:
+        return None
+    _, name, s1, tr = best
+    s2 = trade_stats([t["r"] for t in tr if t["t"] >= mid_t])
+    head = "VALIDACION FUERA DE MUESTRA\n  Mejor variante segun la 1a mitad: %s (n=%d, R neto %+.2f)\n" % (
+        name, s1["n"], s1["avg"])
+    if s2 is None:
+        return head + "  La 2a mitad no tiene senales: no se puede validar."
+    verdict = ("se mantiene positiva (aun asi, prueba unos dias en demo)" if s2["avg"] > 0
+               else "NO se mantiene (R neto <= 0): lo mas probable es que fuese azar")
+    return head + "  Resultado en la 2a mitad, no usada para elegirla: n=%d, R neto %+.2f ±%.2f -> %s" % (
+        s2["n"], s2["avg"], s2["ci"], verdict)
+
+
 def run_backtest(cfg, only, days, top, compare):
-    symbols, meta = load_symbols(cfg, only)
+    ex = EXCHANGES["bingx" if cfg.exchange == "both" else cfg.exchange]
+    symbols, meta = ex.load_symbols(cfg, only)
     if top:
         symbols = symbols[:top]
-    print("Descargando %d dias de velas 5m de %d monedas (puede tardar 1-3 min)..." % (days, len(symbols)))
+    btc = ex.btc_symbol
+    to_get = list(symbols) + ([btc] if btc not in symbols else [])    # BTC tambien como referencia del filtro BTC
+    print("[%s] Descargando %d dias de velas 5m de %d monedas (puede tardar 1-3 min)..." % (
+        ex.label, days, len(to_get)))
     data = {}
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {ex.submit(fetch_history, cfg, s, days): s for s in symbols}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {pool.submit(ex.fetch_history, cfg, x, days): x for x in to_get}
         for f in as_completed(futs):
             try:
                 bars = f.result()
@@ -1585,28 +1735,37 @@ def run_backtest(cfg, only, days, top, compare):
                 continue
             if len(bars) > 300:
                 data[futs[f]] = bars
-    if not data:
-        sys.exit("No se pudo descargar historico (revisa EXCHANGE, la region del servidor y BASE_URL).")
-    t_end = max(b[-1]["t"] for b in data.values())
+    scan_data = {x: v for x, v in data.items() if x in symbols}
+    if not scan_data:
+        sys.exit("No se pudo descargar historico (revisa la region / la URL del exchange).")
+    ref_map = None
+    if btc in data:
+        ref_map = {b["t"]: tr for b, tr in zip(data[btc], trend_series(data[btc], cfg))}
+    elif cfg.btc_filter or compare:
+        print("AVISO: no hay historico de %s: las variantes con filtro BTC se ejecutan sin filtro." % btc)
+    t_end = max(b[-1]["t"] for b in scan_data.values())
     warm_t = t_end - days * 86_400_000
     mid_t = warm_t + (t_end - warm_t) // 2
-    preps = {sym: prepare_series(bars, cfg) for sym, bars in data.items()}
-    print("%d monedas con datos | periodo evaluado: %d dias | comisiones: %.3f%% por lado\n" % (
-        len(data), days, cfg.fee_pct))
+    preps = {sym: prepare_series(bars, cfg) for sym, bars in scan_data.items()}
+    print("%d monedas con datos | periodo evaluado: %d dias | costes por lado: comision %.3f%% + deslizamiento %.3f%%\n" % (
+        len(scan_data), days, cfg.fee_pct, cfg.slippage_pct))
 
     funnel = {}
-    base = backtest_variant(cfg, data, meta, preps, warm_t, funnel)
+    base = backtest_variant(cfg, scan_data, meta, preps, warm_t, funnel, ref_map)
     print("EMBUDO DE FILTROS (tu configuracion)")
     print(funnel_text(funnel, top=6), "\n")
 
-    print("RESULTADOS (R neto de comisiones; R = tu riesgo por trade)")
+    print("RESULTADOS (R neto de costes; R = tu riesgo por trade)")
     print(ROW_HEAD)
     rows = [("tu configuracion", base)]
     if compare:
         for name, kw in VARIANTS[1:]:
-            rows.append((name, backtest_variant(replace(cfg, **kw), data, meta, preps, warm_t)))
+            rows.append((name, backtest_variant(replace(cfg, **kw), scan_data, meta, preps, warm_t, None, ref_map)))
     for name, tr in rows:
         print(_row(name, tr, mid_t))
+    if compare:
+        wf = walk_forward_text(rows, mid_t)
+        print("\n" + (wf or "VALIDACION FUERA DE MUESTRA: ninguna variante tiene n >= 30 en la 1a mitad (usa mas --days o --top)."))
 
     if base:
         print("\nGESTION DEL TRADE (mismas entradas de tu configuracion)")
@@ -1618,284 +1777,13 @@ def run_backtest(cfg, only, days, top, compare):
         _group(base, "session", "sesion")
         _group(base, "side", "lado")
         _group(base, "score", "puntuacion")
-        print("\nFrecuencia: %.2f senales/dia en %d monedas" % (len(base) / float(days), len(data)))
+        print("\nFrecuencia: %.2f senales/dia en %d monedas" % (len(base) / float(days), len(scan_data)))
 
     print("\nLECTURA: una variante solo merece confianza si (1) n >= 100-200, (2) el R neto es positivo en la 1a y en la\n"
           "2a mitad, y (3) el intervalo ±95%% no incluye 0. Con %d variantes probadas, alguna saldra positiva por azar:\n"
-          "confirma la elegida en demo/papel unos dias antes de usar dinero real. Un backtest no garantiza nada.\n"
-          "Limites: entrada al cierre de la vela (sin deslizamiento), SL primero si SL y TP caen en la misma vela." % len(rows))
-
-
-# ============================================================================
-#  AUTOAJUSTE (walk-forward con salvaguardas contra el sobreajuste)
-# ============================================================================
-# Cada AUTOTUNE_HOURS el bot descarga AUTOTUNE_DAYS dias de una MUESTRA de monedas (1/3 las mas liquidas + el resto
-# al azar, con semilla diaria: cada dia otra muestra, asi con el tiempo se cubre toda la lista), simula una rejilla
-# FIJA de 216 variantes con costes (comision + deslizamiento) y elige la mejor segun estas reglas:
-#   1) >= AUTOTUNE_MIN_TRADES operaciones y R neto > 0 en AMBOS tramos: entrenamiento (primeros 2/3) y
-#      validacion (ultimo 1/3);
-#   2) cota inferior (R medio - Z * error estandar) sobre todo el periodo > 0;
-#   3) solo sustituye a la actual si mejora su cota inferior en >= AUTOTUNE_MIN_GAIN_R (histeresis);
-#   4) si NINGUNA cumple, no inventa nada: mantiene la actual y marca las señales como "sin ventaja validada".
-# Probar 216 variantes genera falsos positivos por azar: estas reglas los reducen, no los eliminan.
-TUNE_ENTRIES = [(c, t, b, ss) for c in (True, False) for t in (False, True) for b in (False, True)
-                for ss in ((1, 2), (1, 2, 3), (0, 1, 2, 3))]
-TUNE_SCORES = (3, 4, 5)
-TUNE_EXITS = [(2.0, 1.0, 50.0), (3.0, 1.0, 50.0), (1.5, 99.0, 0.0)]      # (rr, partial_r, partial_pct)
-TIER_NAMES = ("liquidas", "medias", "cola")
-RUNTIME = {"edge": None}                                                # True / False / None (sin evaluar aun)
-_tune = {"running": False, "result": None}
-
-
-def cfg_key(cfg):
-    return (bool(cfg.require_chain), bool(cfg.trend_filter), bool(cfg.btc_filter), tuple(cfg.sessions),
-            int(cfg.min_score), float(cfg.rr), float(cfg.partial_r), float(cfg.partial_pct))
-
-
-def key_dict(key):
-    return {"require_chain": key[0], "trend_filter": key[1], "btc_filter": key[2], "sessions": list(key[3]),
-            "min_score": key[4], "rr": key[5], "partial_r": key[6], "partial_pct": key[7]}
-
-
-def apply_tuned(cfg, d):
-    """Aplica un dict de parametros ajustados (tambien el leido de state.json)."""
-    if not d:
-        return
-    cfg.require_chain = bool(d["require_chain"])
-    cfg.trend_filter = bool(d["trend_filter"])
-    cfg.btc_filter = bool(d.get("btc_filter", False))
-    cfg.sessions = tuple(int(x) for x in d["sessions"])
-    cfg.min_score = int(d["min_score"])
-    cfg.rr = float(d["rr"])
-    cfg.partial_r = float(d["partial_r"])
-    cfg.partial_pct = float(d["partial_pct"])
-
-
-def describe_key(key):
-    ex = "sin parcial, TP %.1fR" % key[5] if key[7] <= 0 else "%.0f%% en %.1fR + TP %.1fR" % (key[7], key[6], key[5])
-    return "cadena %s · tendencia 1H %s · BTC %s · sesiones %s · score ≥ %d · %s" % (
-        "obligatoria" if key[0] else "opcional", "obligatoria" if key[1] else "opcional",
-        "a favor" if key[2] else "indiferente", ",".join(SESSION_NAMES[i] for i in key[3]), key[4], ex)
-
-
-def pick_sample(symbols, n, seed):
-    """(simbolo, nivel_de_liquidez) para ajustar. Si hay <= n monedas, todas. Si no: el primer tercio del cupo son las
-    mas liquidas y el resto una muestra aleatoria (semilla diaria) del resto de la lista, que ya viene ordenada por volumen."""
-    total = len(symbols)
-    tier = lambda i: 0 if i < total / 3.0 else (1 if i < 2 * total / 3.0 else 2)  # noqa: E731
-    if total <= n:
-        return [(s_, tier(i)) for i, s_ in enumerate(symbols)]
-    k = max(1, n // 3)
-    idx = list(range(k)) + sorted(random.Random(seed).sample(range(k, total), n - k))
-    return [(symbols[i], tier(i)) for i in idx]
-
-
-def autotune_collect(base, sample, meta, days, btc, deadline):
-    """Descarga y simula, moneda a moneda (memoria baja). Devuelve (resultados, n_monedas, t_ini, t_fin)."""
-    horizon = int(base.track_hours * 12)
-    entries = [e for e in TUNE_ENTRIES if btc or not e[2]]
-    results, n_ok, t_hi = {}, 0, 0
-    for sym, tier in sample:
-        if time.time() > deadline:
-            log.warning("autoajuste: presupuesto de tiempo agotado tras %d monedas", n_ok)
-            break
-        time.sleep(0.15)                                       # no competir con el escaneo en vivo por el limite de peticiones
-        try:
-            bars = fetch_history(base, sym, days)
-        except Exception as e:
-            log.warning("autoajuste %s: %s", sym, e)
-            continue
-        if len(bars) < 600:
-            continue
-        n_ok += 1
-        t_hi = max(t_hi, bars[-1]["t"])
-        warm_t = bars[-1]["t"] - days * 86_400_000
-        prep = prepare_series(bars, base)
-        tick = meta.get(sym, {}).get("tick", 0.0001)
-        for chain, trend, use_btc, ss in entries:
-            c0 = replace(base, require_chain=chain, trend_filter=trend, btc_filter=use_btc, sessions=ss, min_score=0)
-            sigs = [x for x in scan_series(sym, bars, tick, c0, only_last=False, prep=prep, btc=btc if use_btc else None)
-                    if x["entry_t"] >= warm_t and x["bar_i"] + horizon < len(bars)]
-            sigs.sort(key=lambda x: x["entry_t"])
-            for ms in TUNE_SCORES:
-                accepted, last_t = [], -10 ** 15
-                for x in sigs:
-                    if x["score"] < ms or x["entry_t"] - last_t < base.symbol_cooldown_min * 60_000:
-                        continue
-                    last_t = x["entry_t"]
-                    accepted.append(x)
-                for rr, pr, pp in TUNE_EXITS:
-                    ce = replace(base, rr=rr, partial_r=pr, partial_pct=pp)
-                    lst = results.setdefault((chain, trend, use_btc, ss, ms, rr, pr, pp), [])
-                    for x in accepted:
-                        fut = bars[x["bar_i"] + 1: x["bar_i"] + 1 + horizon]
-                        lst.append((x["entry_t"], simulate_trade(x, fut, ce)[1], tier))
-    t_lo = t_hi - days * 86_400_000
-    return results, n_ok, t_lo, t_hi
-
-
-def tier_stats(trs):
-    """{nivel: (n, R medio)} para operaciones con nivel de liquidez."""
-    out = {}
-    for x in trs:
-        if len(x) > 2:
-            out.setdefault(x[2], []).append(x[1])
-    return {t: (len(v), sum(v) / len(v)) for t, v in out.items()}
-
-
-def tune_select(cfg, results, t_split):
-    """Aplica las reglas de validacion. Devuelve (stats, eligible, best, inc, decision, edge)."""
-    stats = {}
-    for key, trs in results.items():
-        st = trade_stats([x[1] for x in trs])
-        if not st:
-            continue
-        tr = trade_stats([x[1] for x in trs if x[0] < t_split])
-        va = trade_stats([x[1] for x in trs if x[0] >= t_split])
-        se = st["ci"] / 1.96
-        stats[key] = {"st": st, "tr": tr, "va": va, "lcb": st["avg"] - cfg.autotune_z * se}
-    need_va = max(10, cfg.autotune_min_trades // 3)
-    eligible = [k for k, v in stats.items()
-                if v["st"]["n"] >= cfg.autotune_min_trades and v["va"] and v["va"]["n"] >= need_va
-                and v["tr"] and v["tr"]["avg"] > 0 and v["va"]["avg"] > 0 and v["lcb"] > 0]
-    best = max(eligible, key=lambda k: stats[k]["lcb"]) if eligible else None
-    inc = cfg_key(cfg)
-    if best is None:
-        return stats, eligible, best, inc, "keep", False
-    if inc in eligible and (best == inc or stats[best]["lcb"] < stats[inc]["lcb"] + cfg.autotune_min_gain_r):
-        return stats, eligible, best, inc, "keep", True
-    return stats, eligible, best, inc, "switch", True
-
-
-def autotune_run(base, symbols, meta):
-    """symbols: lista COMPLETA ordenada por volumen (la muestra se elige aqui)."""
-    t0 = time.time()
-    seed = int(t0 // 86400)
-    sample = pick_sample(symbols, base.autotune_top or len(symbols), seed)
-    random.Random(seed).shuffle(sample)                       # si se agota el tiempo, el corte no sesga hacia las liquidas
-    btc = None
-    try:
-        bb = fetch_history(base, norm_symbol("BTCUSDT", base.exchange), base.autotune_days)
-        if len(bb) >= 600:
-            btc = btc_trend_map(bb, base.trend_ema_bars)
-    except Exception as e:
-        log.warning("autoajuste sin variantes BTC (no hay datos de BTC): %s", e)
-    results, n_ok, t_lo, t_hi = autotune_collect(base, sample, meta, base.autotune_days, btc,
-                                                 t0 + base.autotune_max_minutes * 60)
-    if n_ok == 0:
-        raise RuntimeError("autoajuste: no se pudo descargar historico de ninguna moneda")
-    t_split = t_lo + (t_hi - t_lo) * 2 // 3
-    stats, eligible, best, inc, decision, edge = tune_select(base, results, t_split)
-    return {"stats": stats, "eligible": eligible, "best": best, "inc": inc, "decision": decision, "edge": edge,
-            "tiers": {"best": tier_stats(results[best]) if best else {}, "inc": tier_stats(results.get(inc, []))},
-            "n_symbols": n_ok, "n_total": len(symbols), "days": base.autotune_days,
-            "secs": time.time() - t0, "when": time.time()}
-
-
-def autotune_job(base, symbols, meta):
-    try:
-        _tune["result"] = autotune_run(base, symbols, meta)
-    except Exception as e:                                    # nunca debe tumbar el bot
-        log.error("autoajuste fallido: %s", e)
-        _tune["result"] = {"error": str(e)}
-    finally:
-        _tune["running"] = False
-
-
-def maybe_launch_autotune(cfg, st, symbols, meta):
-    if not cfg.autotune or _tune["running"] or not symbols:
-        return
-    now = time.time()
-    if now - st.get("last_tune", 0.0) < cfg.autotune_hours * 3600:
-        return
-    st["last_tune"] = now
-    _tune["running"] = True
-    log.info("autoajuste: lanzado (%d de %d monedas, %d dias)",
-             min(len(symbols), cfg.autotune_top) if cfg.autotune_top else len(symbols), len(symbols), cfg.autotune_days)
-    threading.Thread(target=autotune_job, args=(replace(cfg), list(symbols), dict(meta)), daemon=True).start()
-
-
-def _stat_line(v):
-    f = lambda x: ("%+.2fR" % x["avg"]) if x else "-"  # noqa: E731
-    return "%d ops · acierto %.0f%% · R neto %+.2f ±%.2f · entren. %s · valid. %s" % (
-        v["st"]["n"], v["st"]["win"], v["st"]["avg"], v["st"]["ci"], f(v["tr"]), f(v["va"]))
-
-
-def tier_line(ts):
-    if not ts:
-        return ""
-    return "Por liquidez: " + " · ".join("%s %+.2fR (n=%d)" % (TIER_NAMES[t], avg, n) for t, (n, avg) in sorted(ts.items()))
-
-
-def tune_message(cfg, res, applied):
-    st, best, inc = res["stats"], res["best"], res["inc"]
-    head = "🧠 <b>Autoajuste</b> · %d de %d monedas · %d dias" % (res["n_symbols"], res.get("n_total", res["n_symbols"]), res["days"])
-    tiers = res.get("tiers", {})
-    if res["decision"] == "switch":
-        verb = "Aplicado" if applied else "Propuesta (AUTOTUNE_MODE=suggest, no aplicada)"
-        lines = [head, "%s: <b>%s</b>" % (verb, describe_key(best)), _stat_line(st[best]), tier_line(tiers.get("best"))]
-        if inc in st:
-            lines += ["Antes: %s" % describe_key(inc), _stat_line(st[inc])]
-        else:
-            lines.append("Antes: %s (sin operaciones suficientes)" % describe_key(inc))
-    elif res["edge"]:
-        lines = [head, "Se mantiene la configuracion actual (validada): %s" % describe_key(inc), _stat_line(st[inc]),
-                 tier_line(tiers.get("inc"))]
-    else:
-        lines = [head, "⚠️ <b>Ninguna variante muestra ventaja validada</b> en los ultimos %d dias "
-                 "(tras costes, en entrenamiento y validacion)." % res["days"],
-                 "Las señales siguen llegando con la configuracion actual, pero marcadas como experimentales. "
-                 "No significa que vaya a perder: significa que no hay evidencia de que gane."]
-        if inc in st:
-            lines += [_stat_line(st[inc]), tier_line(tiers.get("inc"))]
-    lines.append("<i>Simulado con velas de 5m, neto de comisiones y deslizamiento estimado. Probar muchas variantes puede dar falsos positivos.</i>")
-    return "\n".join(x for x in lines if x)
-
-
-def absorb_tune(cfg, st, dry_run=False):
-    """Recoge el resultado del hilo de autoajuste (lo llama run_once con el estado ya cargado)."""
-    res = _tune["result"]
-    if res is None:
-        return
-    _tune["result"] = None
-    if "error" in res:
-        return
-    prev_edge = st.get("edge")
-    st["edge"] = res["edge"]
-    RUNTIME["edge"] = res["edge"]
-    applied = False
-    if res["decision"] == "switch" and cfg.autotune_mode == "apply":
-        st["tuned"] = key_dict(res["best"])
-        apply_tuned(cfg, st["tuned"])
-        applied = True
-    changed = res["decision"] == "switch" or prev_edge != res["edge"]
-    log.info("autoajuste: decision=%s edge=%s (%.0fs)", res["decision"], res["edge"], res["secs"])
-    if changed and not dry_run:
-        emit(tune_message(cfg, res, applied), False)
-
-
-def print_tune_report(cfg, res, top=12):
-    st = res["stats"]
-    print("AUTOAJUSTE · %d de %d monedas · %d dias · %.0fs" % (res["n_symbols"], res.get("n_total", res["n_symbols"]),
-                                                              res["days"], res["secs"]))
-    rows = sorted(st.items(), key=lambda kv: -kv[1]["lcb"])
-    print("%-4s %-106s %5s %6s %7s %7s %7s" % ("", "variante", "n", "win", "R neto", "cota", "valid."))
-    for key, v in rows[:top]:
-        mark = "*" if key in res["eligible"] else " "
-        mine = "<-- actual" if key == res["inc"] else ""
-        print("%-4s %-106s %5d %5.0f%% %+7.2f %+7.2f %7s %s" % (
-            mark, describe_key(key)[:106], v["st"]["n"], v["st"]["win"], v["st"]["avg"], v["lcb"],
-            ("%+.2f" % v["va"]["avg"]) if v["va"] else "-", mine))
-    print("\n(*) = cumple todas las reglas de validacion: %d de %d variantes" % (len(res["eligible"]), len(st)))
-    if res["inc"] in st and res["inc"] not in [k for k, _ in rows[:top]]:
-        print("Tu configuracion actual: %s | %s" % (describe_key(res["inc"]), _stat_line(st[res["inc"]])))
-    tiers = res.get("tiers", {})
-    if res["best"] and tier_line(tiers.get("best")):
-        print("Mejor validada -> " + tier_line(tiers.get("best")))
-    if tier_line(tiers.get("inc")):
-        print("Actual         -> " + tier_line(tiers.get("inc")))
-    print("DECISION:", {"switch": "cambiar a la mejor validada", "keep": "mantener la actual"}[res["decision"]],
-          "| ventaja validada:", "SI" if res["edge"] else "NO")
+          "usa la VALIDACION FUERA DE MUESTRA y confirma la elegida en demo/papel unos dias antes de usar dinero real.\n"
+          "Limites: entrada al cierre de la vela (el deslizamiento se aproxima con SLIPPAGE_PCT), SL primero si SL y TP caen\n"
+          "en la misma vela, y no modela FRESH_CHECK ni los limites de exposicion del modo en vivo." % len(rows))
 
 
 # ============================================================================
@@ -1907,7 +1795,8 @@ def _ms(y, mo, d, h, mi):
 
 def sample_signal():
     """Senal de ejemplo para --test-telegram."""
-    return {"symbol": "BTCUSDT", "side": "LONG", "entry": 100000.0, "sl": 99500.0, "tp1": 100500.0,
+    return {"exchange": "bingx", "min_qty": 0.0001, "mss": True, "btc": 1, "price_now": 100020.0,
+            "symbol": "BTC-USDT", "side": "LONG", "entry": 100000.0, "sl": 99500.0, "tp1": 100500.0,
             "tp2": 101000.0, "max_entry": 100150.0, "risk_pct": 0.5, "chain": "Prof 4 | Daily a Nano | Q2",
             "session": "NY AM", "time_ny": datetime.now(NY).strftime("%Y-%m-%d %H:%M"), "cycle_start_ms": 0,
             "entry_t": 0, "tick": 0.1, "step": 0.001, "score": 4, "q1_level": 99650.0,
@@ -1916,6 +1805,8 @@ def sample_signal():
 
 
 def selftest():
+    global requests, _BINGX_LIMITER
+    import types
     ok = True
 
     def check(name, cond):
@@ -2008,10 +1899,9 @@ def selftest():
     check("comisiones: SL 0.2% (0.5R de fees) descartado",
           _build_signal("T", "LONG", bar0, 99.8, 0.01, Config(), None, qi0, 0, exb) is None)
     sg = _build_signal("T", "LONG", bar0, 99.5, 0.01, Config(), None, qi0, 0, exb)
-    check("costes: SL 0.5% pasa; (0.05%+0.02%)x2 / 0.5% = 0.28R",
-          sg is not None and abs(sg["fee_r"] - 0.28) < 1e-9)
-    sg0 = _build_signal("T", "LONG", bar0, 99.5, 0.01, Config(slip_pct=0.0), None, qi0, 0, exb)
-    check("costes: sin deslizamiento = 0.20R", sg0 is not None and abs(sg0["fee_r"] - 0.2) < 1e-9)
+    check("costes: SL 0.5% pasa y fee_r = 0.28R (0.05% + 0.02% por lado)", sg is not None and abs(sg["fee_r"] - 0.28) < 1e-9)
+    sg0 = _build_signal("T", "LONG", bar0, 99.5, 0.01, Config(slippage_pct=0.0), None, qi0, 0, exb)
+    check("sin deslizamiento fee_r vuelve a 0.2R", sg0 is not None and abs(sg0["fee_r"] - 0.2) < 1e-9)
     check("puntuacion suma tendencia 1H y volumen", sg is not None and sg["score"] == score_signal(exb, Config()) == 4)
 
     # 4d) EMA
@@ -2049,410 +1939,145 @@ def selftest():
     check("trend_filter reduce (o iguala) las senales",
           len(scan_series("SYN", syn, 0.0001, replace(loose, trend_filter=True), only_last=False)) <= len(full))
 
-    # 6) BingX: formatos de velas, TradFi, simbolos
-    d_ = _bx_bar({"time": 1700000000000, "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "10"})
-    l_ = _bx_bar([1700000000, "1", "2", "0.5", "1.5", "10"])
-    check("BingX vela dict == lista, segundos -> ms, volumen ~ USDT",
-          d_["t"] == l_["t"] == 1700000000000 and abs(d_["v"] - 15.0) < 1e-9 and d_["h"] == 2.0)
-    bb = _bx_bars([{"time": 1700000300000, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
-                   {"time": 1700000000000, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10},
-                   {"time": 1700000000000, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10}])
-    check("BingX velas: orden ascendente y sin duplicados", [x["t"] for x in bb] == [1700000000000, 1700000300000])
-    check("TradFi detectado (NCSK/NCCO/..2USD) y cripto no",
-          is_tradfi("NCSKTSLA2USD-USDT") and is_tradfi("NCCOGOLD2USD-USDT")
-          and not any(is_tradfi(x) for x in ("BTC-USDT", "1000PEPE-USDT", "NCT-USDT", "SOL-USDT")))
-    check("norm_symbol BingX/Binance", norm_symbol("btcusdt", "bingx") == "BTC-USDT"
-          and norm_symbol("BTC-USDT", "binance") == "BTCUSDT" and norm_symbol("ETH-USDT", "bingx") == "ETH-USDT")
-
-    g = globals()
-    saved = {k: g[k] for k in ("bx_get", "http_get", "fetch_history", "emit", "fetch_bars", "fetch_book", "scan_all", "STATE_FILE")}
-    try:
-        contracts = [
-            {"symbol": "BTC-USDT", "status": 1, "pricePrecision": 1, "quantityPrecision": 4, "apiStateOpen": "true"},
-            {"symbol": "ETH-USDT", "status": 1, "pricePrecision": 2, "quantityPrecision": 3, "apiStateOpen": "true"},
-            {"symbol": "OLD-USDT", "status": 0, "pricePrecision": 2, "quantityPrecision": 1},
-            {"symbol": "CLS-USDT", "status": 1, "pricePrecision": 2, "quantityPrecision": 1, "apiStateOpen": "false"},
-            {"symbol": "BTC-USD", "status": 1, "pricePrecision": 2, "quantityPrecision": 1},
-            {"symbol": "NCSKAAPL2USD-USDT", "status": 1, "pricePrecision": 2, "quantityPrecision": 1},
-            {"symbol": "LOW-USDT", "status": 1, "pricePrecision": 4, "quantityPrecision": 0},
-        ]
-        tickers = [{"symbol": "BTC-USDT", "quoteVolume": "5000000000"}, {"symbol": "ETH-USDT", "volume": "1000", "lastPrice": "3000000"},
-                   {"symbol": "NCSKAAPL2USD-USDT", "quoteVolume": "30000000"}, {"symbol": "LOW-USDT", "quoteVolume": "100000"},
-                   {"symbol": "OLD-USDT", "quoteVolume": "9e9"}, {"symbol": "CLS-USDT", "quoteVolume": "9e9"}]
-        NOWB = int(time.time() * 1000) // BAR_MS * BAR_MS
-        store = [{"time": NOWB - (6000 - i) * BAR_MS, "open": "100", "high": "101", "low": "99", "close": "100.5",
-                  "volume": "10"} for i in range(6001)]            # la ultima (i=6000) es la vela ABIERTA
-
-        def fake_bx(cfg_, path, params=None):
-            params = params or {}
-            if path.endswith("/quote/contracts"):
-                return contracts
-            if path.endswith("/quote/ticker"):
-                return tickers
-            if path.endswith("/quote/depth"):
-                return {"bids": [["99.95", "500"], ["99.9", "800"]], "asks": [["100.05", "500"], ["100.1", "800"]]}
-            if path.endswith("/quote/klines"):
-                end_ = params.get("endTime", NOWB + BAR_MS)
-                rows = [x for x in store if x["time"] <= end_][-int(params.get("limit", 500)):]
-                return list(reversed(rows))                         # BingX puede devolverlas en orden descendente
-            raise AssertionError(path)
-        g["bx_get"] = fake_bx
-        cb = Config(min_quote_volume=1e7)
-        sy, mt = load_symbols_bingx(cb, [])
-        check("BingX contratos: filtra offline/no-USDT/TradFi/poco volumen y ordena por volumen",
-              sy == ["BTC-USDT", "ETH-USDT"] and abs(mt["BTC-USDT"]["tick"] - 0.1) < 1e-12
-              and abs(mt["ETH-USDT"]["step"] - 0.001) < 1e-12)
-        sy2, _ = load_symbols_bingx(replace(cb, include_tradfi=True, exclude_symbols=("ETHUSDT",)), [])
-        check("BingX: include_tradfi y EXCLUDE_SYMBOLS en formato BTCUSDT", sy2 == ["BTC-USDT", "NCSKAAPL2USD-USDT"])
-        sy3, _ = load_symbols_bingx(cb, ["ethusdt"])
-        check("BingX: --symbols acepta ETHUSDT", sy3 == ["ETH-USDT"])
-        bars_ = fetch_bars_bingx(cb, "BTC-USDT")
-        check("BingX fetch_bars: ascendente y sin la vela abierta (499 pedidas -> 498 cerradas)",
-              len(bars_) == 498 and bars_[-1]["t"] == NOWB - BAR_MS and all(a_["t"] < b_["t"] for a_, b_ in zip(bars_, bars_[1:])))
-        hist = fetch_history_bingx(cb, "BTC-USDT", 10)
-        check("BingX historico paginado hacia atras (10 dias = %d velas)" % len(hist),
-              abs(len(hist) - 11 * 288) <= 1 and hist[-1]["t"] == NOWB - BAR_MS
-              and len({x["t"] for x in hist}) == len(hist))
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            ok_ = check_exchange(Config(min_quote_volume=1e7))
-        check("--check-exchange con BingX simulado: TODO OK", ok_ and "TODO OK" in buf.getvalue())
-
-        # firma HMAC
-        seen = {}
-
-        def fake_http(url, params=None, tries=3, headers=None):
-            seen.update(url=url, params=dict(params or {}), headers=headers)
-            return seen.get("reply", {"code": 0, "data": [1]})
-        g["http_get"] = fake_http
-        g["bx_get"] = saved["bx_get"]
-        os.environ.pop("BINGX_API_KEY", None)
-        os.environ.pop("BINGX_API_SECRET", None)
-        saved_thr = _thr_next[0]
-        bx_get(cb, "/openApi/swap/v2/quote/contracts", {"symbol": "BTC-USDT"})
-        check("BingX sin claves: peticion publica con timestamp y sin firma",
-              "timestamp" in seen["params"] and "signature" not in seen["params"] and not seen["headers"])
-        os.environ.update(BINGX_API_KEY="k123", BINGX_API_SECRET="s456")
-        bx_get(cb, "/openApi/swap/v2/quote/contracts", {"symbol": "BTC-USDT"})
-        pp = dict(seen["params"])
-        sig = pp.pop("signature")
-        qs = "&".join("%s=%s" % (n, pp[n]) for n in pp)
-        check("BingX con claves: cabecera X-BX-APIKEY y HMAC-SHA256 correcto",
-              seen["headers"] == {"X-BX-APIKEY": "k123"}
-              and sig == hmac.new(b"s456", qs.encode(), hashlib.sha256).hexdigest() and "timestamp" in pp)
-        os.environ.pop("BINGX_API_KEY", None)
-        os.environ.pop("BINGX_API_SECRET", None)
-        seen["reply"] = {"code": 100001, "msg": "signature mismatch"}
-        try:
-            bx_get(cb, "/x")
-            raised = False
-        except RuntimeError as e_:
-            raised = "100001" in str(e_)
-        check("BingX: codigo de error de la API -> excepcion con el mensaje", raised)
-        g["http_get"] = saved["http_get"]
-
-        # 7) Autoajuste: reglas de seleccion
-        ct = Config(autotune_min_trades=40, autotune_z=2.0, autotune_min_gain_r=0.1)
-        inc = cfg_key(ct)
-        other = lambda **kw: cfg_key(replace(ct, **kw))  # noqa: E731
-        mk_res = lambda base_, amp, n=60, shift=0: [(i * 33 + shift, base_ + (amp if i % 2 else -amp)) for i in range(n)]  # noqa: E731
-        good, good2, bad = other(min_score=4), other(min_score=5), other(min_score=3, rr=3.0)
-        unstable, tiny = other(rr=1.5), other(trend_filter=True)
-        res_ = {good: mk_res(0.40, 0.10), good2: mk_res(0.15, 0.10), bad: mk_res(-0.2, 0.1),
-                unstable: [(i * 33, 1.0 if i < 30 else -0.7) for i in range(60)], tiny: mk_res(0.5, 0.05, n=10), inc: mk_res(0.05, 0.9)}
-        stt, elig, best, inc_, dec, edge = tune_select(ct, res_, 1000)
-        check("autoajuste: elige la mejor variante validada (descarta negativas, inestables y con pocas operaciones)",
-              best == good and set(elig) >= {good, good2} and unstable not in elig and bad not in elig and tiny not in elig)
-        check("autoajuste: actual no validada + candidata validada -> cambiar con ventaja", dec == "switch" and edge is True)
-        ct2 = replace(ct, min_score=4)           # incumbente == good
-        _, _, best2, _, dec2, edge2 = tune_select(ct2, res_, 1000)
-        check("autoajuste: si la actual ya es la mejor validada -> mantener", dec2 == "keep" and edge2 is True and best2 == good)
-        res_h = dict(res_)
-        res_h[cfg_key(replace(ct, min_score=5))] = mk_res(0.46, 0.10)      # algo mejor que 'good', pero < min_gain
-        ct3 = replace(ct, min_score=4)
-        _, _, best3, _, dec3, _ = tune_select(ct3, res_h, 1000)
-        check("autoajuste: mejora menor que AUTOTUNE_MIN_GAIN_R -> histeresis, no cambia", dec3 == "keep")
-        res_h[cfg_key(replace(ct, min_score=5))] = mk_res(0.80, 0.10)
-        _, _, best4, _, dec4, _ = tune_select(ct3, res_h, 1000)
-        check("autoajuste: mejora grande y validada -> cambia", dec4 == "switch" and best4 == cfg_key(replace(ct, min_score=5)))
-        _, el0, b0, _, d0, e0 = tune_select(ct, {bad: mk_res(-0.2, 0.1), inc: mk_res(-0.1, 0.5)}, 1000)
-        check("autoajuste: ninguna validada -> mantiene y marca edge=False", b0 is None and d0 == "keep" and e0 is False)
-        tuned = json.loads(json.dumps(key_dict(good)))
-        c4 = Config()
-        apply_tuned(c4, tuned)
-        check("autoajuste: parametros ajustados sobreviven a JSON (state.json)", cfg_key(c4) == good and isinstance(c4.sessions, tuple))
-
-        # absorcion del resultado (aplicar / solo proponer / error) y aviso en señales
-        sent_ = []
-        g["emit"] = lambda text, dry, *a_, **k_: sent_.append(text)
-        full_res = {"stats": stt, "eligible": elig, "best": good, "inc": inc, "decision": "switch", "edge": True,
-                    "n_symbols": 5, "days": 21, "secs": 1.0, "when": time.time()}
-        ca = replace(ct, autotune_mode="apply")
-        sa = {"edge": None}
-        _tune["result"] = dict(full_res)
-        absorb_tune(ca, sa)
-        check("autoajuste apply: cambia la configuracion, la guarda y avisa por Telegram",
-              cfg_key(ca) == good and sa["tuned"]["min_score"] == 4 and sa["edge"] is True and len(sent_) == 1 and "Aplicado" in sent_[0])
-        cs = replace(ct, autotune_mode="suggest")
-        ss_ = {"edge": None}
-        sent_.clear()
-        _tune["result"] = dict(full_res)
-        absorb_tune(cs, ss_)
-        check("autoajuste suggest: propone pero NO cambia la configuracion",
-              cfg_key(cs) == inc and "tuned" not in ss_ and len(sent_) == 1 and "no aplicada" in sent_[0])
-        sent_.clear()
-        _tune["result"] = {"error": "boom"}
-        absorb_tune(ca, {"edge": None})
-        check("autoajuste: un error del hilo no rompe nada ni envia mensajes", not sent_ and _tune["result"] is None)
-        RUNTIME["edge"] = False
-        check("señal marcada como experimental cuando no hay ventaja validada",
-              "Experimental" in format_message(sample_signal(), Config()))
-        RUNTIME["edge"] = True
-        check("sin aviso cuando la ventaja esta validada", "Experimental" not in format_message(sample_signal(), Config()))
-        RUNTIME["edge"] = None
-
-
-        # 8) Liquidez real (libro de ordenes) y concentracion
-        book = {"bids": [["99.8", "10"], ["99.9", "5"]], "asks": [["100.2", "10"], ["100.1", "5"]]}
-        bids_, asks_ = parse_book(book)
-        check("parse_book: ordena bids desc y asks asc", bids_[0][0] == 99.9 and asks_[0][0] == 100.1)
-        sp_, im_ = book_cost(bids_, asks_, "LONG", 1000.0)
-        check("book_cost LONG 1000 USDT: spread 0.20%, impacto 0.15%", abs(sp_ - 0.2) < 1e-9 and abs(im_ - 0.15) < 1e-9)
-        sp_, im_ = book_cost(bids_, asks_, "SHORT", 1000.0)
-        check("book_cost SHORT 1000 USDT: impacto 0.15%", abs(im_ - 0.15) < 1e-9)
-        check("book_cost: libro insuficiente -> impacto None", book_cost(bids_, asks_, "LONG", 5000.0)[1] is None
-              and book_cost([], [], "LONG", 10.0) is None)
-        sg_ = sample_signal()
-        g["fetch_book"] = lambda cfg_, sym_: (bids_, asks_)
-        ok1, inf1 = exec_check(Config(account_size=500, max_slip_r=0.20), sg_)      # nocional 1000 USDT
-        ok2, _ = exec_check(Config(account_size=500, max_slip_r=1.00), sg_)
-        check("exec_check: impacto 0.15%% (%.2fR ida y vuelta) > 0.20R rechaza; con 1.00R acepta" % inf1["cost_r"],
-              ok1 is False and ok2 is True and 0.5 < inf1["cost_r"] < 0.7 and abs(inf1["notional"] - 1000.0) < 1e-6)
-        g["fetch_book"] = lambda cfg_, sym_: (bids_[:1], asks_[:1])
-        ok3, inf3 = exec_check(Config(account_size=500), sg_)
-        check("exec_check: libro que no alcanza para tu orden -> rechaza", ok3 is False and inf3["impact"] == float("inf"))
-
-        def boom(cfg_, sym_):
-            raise RuntimeError("sin libro")
-        g["fetch_book"] = boom
-        check("exec_check: sin libro disponible no bloquea (None)", exec_check(Config(account_size=500), sg_) == (None, None))
-
-        # run_once con señales fabricadas: concentracion, liquidez, sin verificar
-        import tempfile
-        saved_state = g["STATE_FILE"]
-        g["STATE_FILE"] = os.path.join(tempfile.mkdtemp(), "state.json")
-        sent2 = []
-        g["emit"] = lambda text, dry, *a_, **k_: (sent2.append(text), {"1": len(sent2)})[1]
-
-        g["fetch_bars"] = lambda cfg_, sym_: []                      # el seguimiento no debe tocar la red
-
-        def fab(n, side="LONG", off=0):
-            out = []
-            for i in range(n):
-                x = dict(sample_signal(), symbol="C%d-USDT" % (i + off), side=side, cycle_start_ms=1000 + i + off,
-                         score=5 - (i % 2), rel_vol=1.0 + i / 10.0)
-                out.append(x)
-            return out
-        cq = Config(autotune=False, heartbeat_hours=0, daily_summary_hour=-1, max_slip_r=0.0, max_open_per_side=3,
-                    min_score=0, symbol_cooldown_min=0)
-        g["scan_all"] = lambda *a_, **k_: fab(7)
-        run_once(cq, [], {}, False)
-        check("concentracion: maximo 3 señales abiertas por lado (7 candidatas -> 3 enviadas)", len(sent2) == 3)
-        sent2.clear()
-        g["scan_all"] = lambda *a_, **k_: fab(5, "LONG", 100)
-        run_once(cq, [], {}, False)
-        check("concentracion: con 3 abiertas no se envian mas LONG, y si SHORT",
-              not sent2)
-        g["scan_all"] = lambda *a_, **k_: fab(2, "SHORT")
-        run_once(cq, [], {}, False)
-        check("concentracion: el cupo es por lado (SHORT sigue entrando)", len(sent2) == 2)
-        g["STATE_FILE"] = os.path.join(tempfile.mkdtemp(), "state.json")
-        sent2.clear()
-        cl = replace(cq, max_slip_r=0.20, max_open_per_side=0, account_size=1000)
-        g["scan_all"] = lambda *a_, **k_: fab(2)
-        g["fetch_book"] = lambda cfg_, sym_: (bids_, asks_)
-        run_once(cl, [], {}, False)
-        check("liquidez: libro caro -> las señales se descartan y no llegan a Telegram", not sent2)
-        g["fetch_book"] = boom
-        run_once(cl, [], {}, False)
-        check("liquidez: libro no disponible -> llega con aviso 'no verificada'",
-              len(sent2) == 2 and all("no verificada" in t_ for t_ in sent2))
-        g["fetch_book"] = lambda cfg_, sym_: ([(99.99, 1e6)], [(100.01, 1e6)])
-        sent2.clear()
-        g["STATE_FILE"] = os.path.join(tempfile.mkdtemp(), "state.json")
-        run_once(cl, [], {}, False)
-        check("liquidez: libro profundo -> llega con spread e impacto", len(sent2) == 2 and all("💧 Liquidez: spread" in t_ for t_ in sent2))
-        g["STATE_FILE"] = saved_state
-        g["scan_all"] = saved["scan_all"]
-        g["fetch_bars"] = saved["fetch_bars"]
-        g["fetch_book"] = saved["fetch_book"]
-
-        # 9) Filtro BTC en el motor
-        base_sigs = scan_series("SYN", syn, 0.0001, loose, only_last=False)
-        n_long = sum(1 for x in base_sigs if x["side"] == "LONG")
-        n_short = len(base_sigs) - n_long
-        lb = replace(loose, btc_filter=True)
-        down = {b["t"]: -1 for b in syn}
-        up = {b["t"]: 1 for b in syn}
-        sd_ = scan_series("SYN", syn, 0.0001, lb, only_last=False, btc=down)
-        su_ = scan_series("SYN", syn, 0.0001, lb, only_last=False, btc=up)
-        check("filtro BTC: BTC bajista bloquea LONG y deja SHORT (%d/%d)" % (n_long, n_short),
-              n_long > 0 and n_short > 0 and not any(x["side"] == "LONG" for x in sd_)
-              and sum(1 for x in sd_ if x["side"] == "SHORT") == n_short)
-        check("filtro BTC: BTC alcista bloquea SHORT y deja LONG",
-              not any(x["side"] == "SHORT" for x in su_) and sum(1 for x in su_ if x["side"] == "LONG") == n_long)
-        check("filtro BTC: sin datos de BTC o neutro no bloquea nada",
-              len(scan_series("SYN", syn, 0.0001, lb, only_last=False, btc=None)) == len(base_sigs)
-              and len(scan_series("SYN", syn, 0.0001, lb, only_last=False, btc={b["t"]: 0 for b in syn})) == len(base_sigs))
-        bm = btc_trend_map([dict(b, c=100.0 + i * 0.1) for i, b in enumerate(syn)], 240)
-        check("btc_trend_map: serie creciente -> tendencia +1 al final", bm[syn[-1]["t"]] == 1 and bm[syn[10]["t"]] == 0)
-
-        # 10) Muestra rotativa y presupuesto del autoajuste
-        names = ["S%03d-USDT" % i for i in range(300)]
-        sm1, sm2, sm3 = pick_sample(names, 90, 1), pick_sample(names, 90, 1), pick_sample(names, 90, 2)
-        check("pick_sample: n exacto, sin duplicados, 1/3 mas liquidas siempre incluidas, determinista",
-              len(sm1) == 90 and len({x[0] for x in sm1}) == 90 and [x[0] for x in sm1[:30]] == names[:30] and sm1 == sm2)
-        check("pick_sample: otra semilla -> otra muestra del resto; incluye cola (nivel 2)",
-              [x[0] for x in sm1] != [x[0] for x in sm3] and {x[1] for x in sm1} == {0, 1, 2})
-        check("pick_sample: pocas monedas -> todas", [x[0] for x in pick_sample(names[:10], 90, 1)] == names[:10])
-        r0, n0, _, _ = autotune_collect(Config(), [("AAA-USDT", 0)], {}, 21, None, 0.0)
-        check("autoajuste: presupuesto de tiempo agotado -> no procesa monedas", n0 == 0 and r0 == {})
-        old_state = json.loads(json.dumps({k_: v_ for k_, v_ in key_dict(good).items() if k_ != "btc_filter"}))
-        c5 = Config(btc_filter=True)
-        apply_tuned(c5, old_state)
-        check("autoajuste: state.json antiguo (sin btc_filter) se aplica sin romper", c5.btc_filter is False and cfg_key(c5)[4] == 4)
-        ts_ = tier_stats([(1, 0.5, 0), (2, -0.5, 0), (3, 1.0, 2), (4, 9.9)])
-        check("tier_stats: agrupa por nivel y tolera tuplas sin nivel", ts_ == {0: (2, 0.0), 2: (1, 1.0)})
-        stt3, el3, b3, _, d3, e3 = tune_select(ct, {good: [(i * 33, 0.4 + (0.1 if i % 2 else -0.1), i % 3) for i in range(60)]}, 1000)
-        check("tune_select acepta operaciones con nivel de liquidez", b3 == good and e3 is True)
-
-        # autoajuste de punta a punta con datos sinteticos (sin red)
-        import random as _r
-        def synth(seed):
-            rn = _r.Random(seed)
-            pr, tt, out = 100.0, _ms(2026, 7, 13, 18, 0), []
-            for _ in range(5 * 288):
-                o_ = pr
-                c_ = o_ * (1 + rn.gauss(0, 0.0025))
-                out.append({"t": tt, "o": o_, "h": max(o_, c_) * (1 + abs(rn.gauss(0, 0.0012))),
-                            "l": min(o_, c_) * (1 - abs(rn.gauss(0, 0.0012))), "c": c_, "v": 1000 * (1 + rn.random())})
-                pr, tt = c_, tt + BAR_MS
-            return out
-        g["fetch_history"] = lambda cfg_, sym_, days_: synth(sum(map(ord, sym_)))
-        rr_ = autotune_run(Config(), ["AAA-USDT", "BBB-USDT"], {})
-        check("autoajuste end-to-end sintetico: %d variantes evaluadas y decision coherente" % len(rr_["stats"]),
-              len(rr_["stats"]) > 60 and rr_["decision"] in ("keep", "switch") and isinstance(rr_["edge"], bool)
-              and rr_["n_symbols"] == 2)
-        g["fetch_bars"] = lambda cfg_, sym_: synth(1)                     # velas de 2026-07: viejas respecto a "ahora"
-        fl_ = {}
-        check("velas desfasadas (el exchange aun no publico la ultima): no se opera con ellas",
-              scan_all(Config(require_chain=False, bias_mode="none", sessions=(0, 1, 2, 3)), ["AAA-USDT"], {}, fl_) == []
-              and not fl_)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            print_tune_report(Config(), rr_)
-        check("informe del autoajuste se imprime", "DECISION" in buf.getvalue())
-    finally:
-        g.update(saved)
-        for k_ in ("BINGX_API_KEY", "BINGX_API_SECRET"):
-            os.environ.pop(k_, None)
-        _tune["result"] = None
-        RUNTIME["edge"] = None
-
     # 5) Variables de entorno
-    os.environ.update({"MIN_SCORE": "3", "SESSIONS": "1,2,3", "ALLOW_SHORT": "false", "EXCLUDE_SYMBOLS": "abc,xyz",
-                       "ACCOUNT_SIZE": "500"})
+    env = {"MIN_SCORE": "3", "SESSIONS": "1,2,3", "ALLOW_SHORT": "false", "EXCLUDE_SYMBOLS": "abc,xyz",
+           "ACCOUNT_SIZE": "500", "EXCHANGE": "BOTH", "BINGX_RPS": "5", "INCLUDE_NON_CRYPTO": "true",
+           "REQUIRE_MSS": "true", "BTC_FILTER": "true", "SLIPPAGE_PCT": "0.03", "MAX_OPEN_PER_SIDE": "2"}
+    os.environ.update(env)
     c = apply_env(Config())
     check("apply_env lee todas las variables", c.min_score == 3 and c.sessions == (1, 2, 3) and c.allow_short is False
-          and c.exclude_symbols == ("ABC", "XYZ") and c.account_size == 500.0 and validate(c) == [])
-    for k in ("MIN_SCORE", "SESSIONS", "ALLOW_SHORT", "EXCLUDE_SYMBOLS", "ACCOUNT_SIZE"):
+          and c.exclude_symbols == ("ABC", "XYZ") and c.account_size == 500.0 and validate(c) == []
+          and c.exchange == "both" and c.bingx_rps == 5.0 and c.include_non_crypto is True
+          and c.require_mss is True and c.btc_filter is True and c.slippage_pct == 0.03 and c.max_open_per_side == 2)
+    for k in env:
         os.environ.pop(k, None)
+    check("EXCHANGE invalido se rechaza", validate(Config(exchange="kraken")) != [])
+
+    # 6) Filtros nuevos sobre el caso sintetico (SHORT tras barrer el Q1, miercoles 15 jul 2026, NY AM)
+    cfg6 = Config(require_chain=False, bias_mode="none", sessions=(1, 2))
+    short_bars = bars[:-1] + [{"t": _ms(2026, 7, 15, 7, 55), "o": 100.5, "h": 100.9, "l": 99.6, "c": 99.7}]
+    check("MSS: cierre por debajo de las 3 velas previas -> señal con mss=True",
+          (lambda r_: len(r_) == 1 and r_[0]["mss"] is True)(analyze("T", short_bars, 0.01, replace(cfg6, require_mss=True))))
+    check("MSS obligatorio bloquea el caso sin ruptura",
+          analyze("T", bars, 0.01, replace(cfg6, require_mss=True)) == []
+          and len(analyze("T", bars, 0.01, cfg6)) == 1)
+    check("BTC 1H alcista bloquea el SHORT; bajista o neutra lo dejan pasar",
+          analyze("T", bars, 0.01, replace(cfg6, btc_filter=True), ref=1) == []
+          and len(analyze("T", bars, 0.01, replace(cfg6, btc_filter=True), ref=-1)) == 1
+          and len(analyze("T", bars, 0.01, replace(cfg6, btc_filter=True), ref=0)) == 1
+          and len(analyze("T", bars, 0.01, replace(cfg6, btc_filter=True), ref=None)) == 1)
+    check("BTC filtro desactivado ignora la tendencia de BTC", len(analyze("T", bars, 0.01, cfg6, ref=1)) == 1)
+    sg_l = {"side": "LONG", "entry": 100.0, "sl": 99.0, "max_entry": 100.3}
+    sg_s = {"side": "SHORT", "entry": 100.0, "sl": 101.0, "max_entry": 99.7}
+    check("precio fresco: vigente / ya se alejo / toco el SL (LONG y SHORT)",
+          stale_reason(sg_l, 100.1) is None and stale_reason(sg_l, 100.5) is not None
+          and stale_reason(sg_l, 98.9) is not None and stale_reason(sg_s, 99.8) is None
+          and stale_reason(sg_s, 99.5) is not None and stale_reason(sg_s, 101.2) is not None)
+    st6 = {"active": {str(i): {"side": "LONG", "status": "open"} for i in range(4)}}
+    check("exposicion: 4 LONG abiertos bloquea LONG pero no SHORT",
+          open_blocked(st6, "LONG", Config()) is not None and open_blocked(st6, "SHORT", Config()) is None)
+    st6["active"].update({str(10 + i): {"side": "SHORT", "status": "open"} for i in range(4)})
+    check("exposicion: total 8 bloquea todo; 0 = sin limite",
+          open_blocked(st6, "SHORT", Config()) is not None
+          and open_blocked(st6, "LONG", Config(max_open_per_side=0, max_open_total=0)) is None)
+    tr_ = trend_series([{"c": 100.0 + i} for i in range(400)], Config())
+    check("trend_series: alcista en una serie creciente, 0 al principio", tr_[-1] == 1 and tr_[10] == 0)
+    good = [{"r": 0.5 if k % 3 else -0.2, "t": k} for k in range(60)]
+    bad = [{"r": 0.4 if k < 30 else -0.5, "t": k} for k in range(60)]
+    wf = walk_forward_text([("buena", good), ("espuria", bad)], 30)
+    check("fuera de muestra: elige la mejor de la 1a mitad y la juzga en la 2a",
+          wf is not None and "espuria" in wf and "NO se mantiene" in wf)
+
+    # 7) BingX: velas, contratos, reintentos
+    now_ms = 10 * BAR_MS + 1000
+    rows = [{"time": i * BAR_MS, "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "9"}
+            for i in range(10, -1, -1)]                    # BingX: la mas nueva primero, con la vela en curso
+    bd = parse_bingx_klines(rows, now_ms)
+    check("BingX velas (dict): orden y vela abierta descartada",
+          len(bd) == 10 and bd[0]["t"] == 0 and bd[-1]["t"] == 9 * BAR_MS and bd[-1]["v"] == 9.0)
+    rows_l = [[i * BAR_MS, "1", "2", "0.5", "1.5", "9", (i + 1) * BAR_MS - 1] for i in range(11)]
+    bl = parse_bingx_klines(rows_l, now_ms)
+    check("BingX velas (lista)", len(bl) == 10 and bl[-1]["h"] == 2.0 and bl[-1]["c"] == 1.5 and bl[-1]["v"] == 9.0)
+    check("BingX precio actual incluye la vela abierta", parse_bingx_klines(rows, 10 ** 18)[-1]["t"] == 10 * BAR_MS)
+
+    contracts = [
+        {"symbol": "BTC-USDT", "status": 1, "pricePrecision": 1, "quantityPrecision": 4, "tradeMinQuantity": 0.0001},
+        {"symbol": "ETH-USDT", "status": 1, "pricePrecision": 2, "quantityPrecision": 3, "tradeMinQuantity": 0.001},
+        {"symbol": "LOWV-USDT", "status": 1, "pricePrecision": 5, "quantityPrecision": 0, "tradeMinQuantity": 1},
+        {"symbol": "NCSKTSLA2USD-USDT", "status": 1, "pricePrecision": 2, "quantityPrecision": 2,
+         "tradeMinQuantity": 0.01},
+        {"symbol": "OLD-USDT", "status": 0, "pricePrecision": 2, "quantityPrecision": 2, "tradeMinQuantity": 1},
+        {"symbol": "BTC-USD", "status": 1, "pricePrecision": 1, "quantityPrecision": 1, "tradeMinQuantity": 1},
+    ]
+    tickers = [{"symbol": "BTC-USDT", "quoteVolume": "900000000"}, {"symbol": "ETH-USDT", "quoteVolume": "50000000"},
+               {"symbol": "LOWV-USDT", "quoteVolume": "1000"}, {"symbol": "NCSKTSLA2USD-USDT", "quoteVolume": "5000000"},
+               {"symbol": "OLD-USDT", "quoteVolume": "9000000"}]
+    syms, meta = parse_bingx_contracts(contracts, tickers, Config())
+    check("BingX contratos: filtra volumen, acciones, inactivos y no-USDT",
+          syms == ["BTC-USDT", "ETH-USDT"] and abs(meta["BTC-USDT"]["tick"] - 0.1) < 1e-12
+          and abs(meta["BTC-USDT"]["step"] - 0.0001) < 1e-12 and meta["BTC-USDT"]["min_qty"] == 0.0001)
+    syms, _ = parse_bingx_contracts(contracts, tickers, Config(min_quote_volume=0, include_non_crypto=True))
+    check("BingX con MIN_QUOTE_VOLUME=0 analiza todas las activas",
+          syms == ["BTC-USDT", "ETH-USDT", "NCSKTSLA2USD-USDT", "LOWV-USDT"])
+    syms, _ = parse_bingx_contracts(contracts, tickers, Config(exclude_symbols=("ETHUSDT",)))
+    check("BingX EXCLUDE_SYMBOLS acepta ETHUSDT o ETH-USDT", syms == ["BTC-USDT"])
+    syms, _ = parse_bingx_contracts(contracts, tickers, Config(), only=["ethusdt"])
+    check("BingX --symbols acepta ETHUSDT", syms == ["ETH-USDT"])
+
+    class FR:
+        def __init__(self, status, js):
+            self.status_code, self._js = status, js
+
+        def json(self):
+            if self._js is None:
+                raise ValueError("no json")
+            return self._js
+
+    seq = []
+    real_req, real_sleep = requests, time.sleep
+    requests = types.SimpleNamespace(get=lambda url, params=None, timeout=0: seq.pop(0), RequestException=OSError)
+    time.sleep = lambda secs: None
+    _BINGX_LIMITER = None
+    try:
+        tcfg = Config(bingx_rps=1000)
+        seq[:] = [FR(200, {"code": 100410, "msg": "rate limit exceeded"}), FR(429, None),
+                  FR(200, {"code": 0, "data": [1, 2]})]
+        check("BingX reintenta ante limite de peticiones", bingx_get(tcfg, "/x") == [1, 2])
+        for resp, needle, name in ((FR(200, {"code": 109400, "msg": "bad"}), "109400", "BingX propaga errores de la API"),
+                                   (FR(451, None), "451", "BingX 451 explica el bloqueo de region")):
+            seq[:] = [resp]
+            try:
+                bingx_get(tcfg, "/x")
+                got = False
+            except RuntimeError as e:
+                got = needle in str(e)
+            check(name, got)
+    finally:
+        requests, time.sleep = real_req, real_sleep
+        _BINGX_LIMITER = None
+    msg = plain(format_message(sample_signal(), Config()))
+    check("mensaje muestra exchange, precio ahora, BTC, MSS y costes",
+          "BTC-USDT" in msg and "BingX" in msg and "Precio ahora" in msg and "BTC 1H" in msg
+          and "Ruptura de estructura" in msg and "deslizamiento" in msg)
 
     print("\nRESULTADO:", "TODO OK" if ok else "HAY FALLOS")
     return 0 if ok else 1
 
 
 # ============================================================================
-def check_exchange(cfg):
-    """Verifica conexion, formato de datos y frescura. Pensado para ejecutarlo la primera vez en tu entorno."""
-    from concurrent.futures import ThreadPoolExecutor as TPE
-    ok = True
-    print("Exchange: %s | %s | firma: %s" % (cfg.exchange, cfg.base_url,
-          "si (BINGX_API_KEY)" if os.environ.get("BINGX_API_KEY") else "no (datos publicos)"))
-    try:
-        if cfg.exchange == "bingx":
-            raw = bx_get(cfg, "/openApi/swap/v2/quote/contracts") or []
-            usdt = [c for c in raw if str(c.get("symbol", "")).upper().endswith("-USDT")]
-            tf = [c["symbol"] for c in usdt if is_tradfi(str(c["symbol"]).upper())]
-            print("Contratos: %d | USDT: %d | TradFi excluidos: %d %s" % (
-                len(raw), len(usdt), len(tf), tf[:6] if not cfg.include_tradfi else "(incluidos)"))
-        syms, meta = load_symbols(cfg, [])
-        print("Monedas que pasan el filtro de volumen (>= %.0f USDT): %d  | primeras: %s" % (
-            cfg.min_quote_volume, len(syms), ", ".join(syms[:5])))
-        if not syms:
-            print("!! 0 monedas: baja MIN_QUOTE_VOLUME"); ok = False
-            return ok
-        sym = norm_symbol("BTCUSDT", cfg.exchange)
-        sym = sym if sym in syms else syms[0]
-        t0 = time.time()
-        bars = fetch_bars(cfg, sym)
-        print("Velas %s: %d en %.2fs | ultima vela: %s UTC | OHLCV %.6g %.6g %.6g %.6g vol~%.0f USDT" % (
-            sym, len(bars), time.time() - t0,
-            datetime.fromtimestamp(bars[-1]["t"] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M"),
-            bars[-1]["o"], bars[-1]["h"], bars[-1]["l"], bars[-1]["c"], bars[-1]["v"]))
-        lag = time.time() - (bars[-1]["t"] + BAR_MS) / 1000.0
-        gaps = sum(1 for a, b in zip(bars, bars[1:]) if b["t"] - a["t"] != BAR_MS)
-        print("Retraso de la ultima vela cerrada: %.0fs (<= 330s es normal) | huecos en la serie: %d" % (lag, gaps))
-        if len(bars) < 300 or lag > 600:
-            print("!! pocas velas o datos desfasados"); ok = False
-        h = fetch_history(cfg, sym, 2)
-        print("Historico 2 dias: %d velas (esperadas ~%d)" % (len(h), 3 * 288))
-        if len(h) < 2 * 288:
-            print("!! el historico llega corto: el backtest/autoajuste no sera fiable"); ok = False
-        picks = sorted({0, len(syms) // 4, len(syms) // 2, (3 * len(syms)) // 4, len(syms) - 1})
-        print("Coste REAL de ejecucion (libro de ordenes) para %.0f USDT, por nivel de liquidez:" % DEFAULT_NOTIONAL)
-        got_book = 0
-        for i in picks:
-            try:
-                bc = book_cost(*fetch_book(cfg, syms[i]), "LONG", DEFAULT_NOTIONAL)
-                got_book += 1
-                print("   #%-4d %-14s spread %.3f%% | impacto %s" % (
-                    i + 1, syms[i], bc[0], ("%.3f%%" % bc[1]) if bc[1] is not None else "libro insuficiente"))
-            except Exception as e:
-                print("   #%-4d %-14s libro no disponible (%s)" % (i + 1, syms[i], str(e)[:80]))
-        if not got_book:
-            print("!! sin libro de ordenes: el filtro de liquidez (MAX_SLIP_R) quedara sin verificar"); ok = False
-        sample = syms[:24]
-        t0 = time.time()
-        with TPE(max_workers=cfg.workers) as ex:
-            res = list(ex.map(lambda x: len(fetch_bars(cfg, x)), sample))
-        dt = time.time() - t0
-        est = dt / max(1, len(sample)) * len(syms)
-        print("Escaneo de %d monedas en %.1fs -> estimado para las %d: ~%.0fs (debe ser < 240s)" % (
-            len(sample), dt, len(syms), est))
-        if est > 240:
-            print("!! demasiado lento: sube MIN_QUOTE_VOLUME o fija MAX_SYMBOLS"); ok = False
-    except Exception as e:
-        print("!! ERROR: %s" % e)
-        ok = False
-    print("\nRESULTADO:", "TODO OK" if ok else "REVISAR LO MARCADO CON !!")
-    return ok
-
-
-
 def main():
-    ap = argparse.ArgumentParser(description="QT Chain Scanner (BingX/Binance Futures -> Telegram)")
+    ap = argparse.ArgumentParser(description="QT Chain Scanner (BingX / Binance Futures -> Telegram)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--test-telegram", action="store_true")
     ap.add_argument("--once", action="store_true", help="un solo escaneo y salir")
+    ap.add_argument("--check", action="store_true", help="comprueba la conexion con el exchange y sale")
+    ap.add_argument("--exchange", choices=["bingx", "binance", "both"], default=None)
     ap.add_argument("--dry-run", action="store_true", help="no envia a Telegram, solo imprime")
-    ap.add_argument("--check-exchange", action="store_true", help="verifica conexion y formato de datos del exchange")
-    ap.add_argument("--autotune", action="store_true", help="ejecuta una vez el autoajuste y muestra el ranking (no aplica)")
     ap.add_argument("--backtest", action="store_true", help="backtest sobre el historico del exchange + embudo de filtros")
     ap.add_argument("--compare", action="store_true", help="con --backtest: prueba variantes de la estrategia")
     ap.add_argument("--days", type=int, default=14, help="dias de historico del backtest (defecto 14)")
     ap.add_argument("--top", type=int, default=40, help="monedas mas liquidas en el backtest (defecto 40, 0 = todas)")
-    ap.add_argument("--symbols", default="", help="lista separada por comas, ej. BTC-USDT,ETH-USDT (tambien vale BTCUSDT)")
+    ap.add_argument("--symbols", default="", help="lista separada por comas, ej. BTC-USDT,ETH-USDT")
     ap.add_argument("--min-volume", type=float, default=None, help="volumen 24h minimo en USDT")
     ap.add_argument("--no-chain", action="store_true", help="no exigir cadena abierta")
     ap.add_argument("--bias", choices=["none", "true_opens"], default=None)
@@ -2467,6 +2092,8 @@ def main():
         sys.exit("Falta 'requests': pip install requests tzdata")
 
     cfg = apply_env(Config())
+    if a.exchange:
+        cfg.exchange = a.exchange
     if a.min_volume is not None:
         cfg.min_quote_volume = a.min_volume
     if a.no_chain:
@@ -2478,28 +2105,22 @@ def main():
     errs = validate(cfg)
     if errs:
         sys.exit("Configuracion invalida:\n- " + "\n- ".join(errs))
-    only = [norm_symbol(x, cfg.exchange) for x in a.symbols.split(",") if x.strip()]
+    only = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
 
     if a.test_telegram:
         send_telegram("✅ QT Scanner conectado. Las señales llegarán a este chat.\nAsí se verá una señal (EJEMPLO, no operar):")
         s = sample_signal()
-        send_telegram("🧪 <b>EJEMPLO</b>\n\n" + format_message(s, cfg), buttons=buttons_for(s["symbol"], cfg.exchange))
+        send_telegram("🧪 <b>EJEMPLO</b>\n\n" + format_message(s, cfg), buttons=buttons_for(s))
         print("Mensajes de prueba enviados.")
-        return
-    if a.check_exchange:
-        sys.exit(0 if check_exchange(cfg) else 1)
-    if a.autotune:
-        symbols, meta = load_symbols(cfg, only)
-        print("Autoajuste sobre %d de %d monedas (puede tardar varios minutos)..." % (
-            min(len(symbols), cfg.autotune_top) if cfg.autotune_top else len(symbols), len(symbols)))
-        print_tune_report(cfg, autotune_run(cfg, symbols, meta))
         return
     if a.backtest:
         run_backtest(cfg, only, max(2, a.days), a.top, a.compare)
         return
+    if a.check:
+        check_exchange(cfg, only)
+        return
     if a.once:
-        symbols, meta = load_symbols(cfg, only)
-        run_once(cfg, symbols, meta, a.dry_run)
+        run_once(cfg, load_markets(cfg, only, a.dry_run), a.dry_run)
     else:
         loop(cfg, a.dry_run, only)
 
