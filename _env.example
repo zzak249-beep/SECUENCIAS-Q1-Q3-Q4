@@ -2,6 +2,15 @@
 # En Railway estas variables se ponen en la pestana "Variables" (ver README).
 # Los comentarios van en lineas aparte: el valor es todo lo que hay tras el "=".
 
+# ---------- EXCHANGE ----------
+# bingx (por defecto) | binance
+EXCHANGE=bingx
+# Incluir perpetuos de acciones/materias primas/forex de BingX (no son cripto 24/7)
+INCLUDE_TRADFI=false
+# Opcionales: solo si BingX rechaza las peticiones publicas pidiendo firma (clave de SOLO LECTURA)
+# BINGX_API_KEY=
+# BINGX_API_SECRET=
+
 # ---------- OBLIGATORIAS ----------
 TELEGRAM_TOKEN=
 # Puedes poner varios chats separados por coma: 123456,-100987654
@@ -17,19 +26,29 @@ MAX_LEVERAGE=10
 
 # ---------- CANTIDAD Y CALIDAD DE SENALES ----------
 # 0 Asia, 1 Londres, 2 NY AM, 3 NY PM
-SESSIONS=1,2
-# 0-5. Sube para menos senales y mejores
-MIN_SCORE=3
+SESSIONS=1,2,3
+# 0-7. Sube para menos senales y mejores
+MIN_SCORE=4
 # Descarta senales con SL a mas de X% (0 = sin limite)
 MAX_RISK_PCT=3
+# Descarta senales cuyas comisiones ida y vuelta superen X R (0 = sin limite)
+MAX_FEE_R=0.35
+# Comision taker por lado en % (BingX/Binance base 0.05)
+FEE_PCT=0.05
+# Deslizamiento estimado por lado en % (backtest, autoajuste y filtro de costes)
+SLIP_PCT=0.02
+# Señal en vivo: descarta si el impacto REAL en el libro de ordenes (ida y vuelta) supera X R (0 = desactivado)
+MAX_SLIP_R=0.20
+# Maximo de señales abiertas en el mismo lado (0 = sin limite). Requiere TRACK_SIGNALS=true
+MAX_OPEN_PER_SIDE=5
 # Minutos sin repetir senal en la misma moneda
 SYMBOL_COOLDOWN_MIN=90
 # 0 = sin limite
 MAX_SIGNALS_PER_DAY=0
 MAX_SIGNALS_PER_SCAN=10
-# Volumen 24h minimo en USDT
-MIN_QUOTE_VOLUME=20000000
-# Ej: USDCUSDT,BTCDOMUSDT (vacio = ninguna)
+# Volumen 24h minimo en USDT. 0 = TODAS las monedas de BingX (el filtro de liquidez por señal te protege)
+MIN_QUOTE_VOLUME=0
+# Ej: BTCDOM-USDT,USDC-USDT (vale tambien BTCDOMUSDT). Vacio = ninguna
 EXCLUDE_SYMBOLS=
 ALLOW_LONG=true
 ALLOW_SHORT=true
@@ -50,9 +69,36 @@ TRACK_SIGNALS=true
 TRACK_HOURS=6
 # Hora NY del resumen diario, -1 = desactivado
 DAILY_SUMMARY_HOUR=18
+# Aviso "sigo activo" + que filtro frena mas senales, cada X horas (0 = desactivado)
+HEARTBEAT_HOURS=8
+
+# ---------- FILTROS v5 ----------
+# Exigir tendencia 1H a favor (true/false). Valida con --backtest --compare
+TREND_FILTER=false
+# No operar contra la tendencia 1H de BTC. El autoajuste lo prueba como variante
+BTC_FILTER=false
+# EMA en velas de 5m (240 = EMA 20 de 1H aprox.)
+TREND_EMA_BARS=240
+# Volumen de la vela de confirmacion / media de 20 velas (0 = desactivado)
+MIN_REL_VOL=0
+
+# ---------- AUTOAJUSTE (ver README seccion 6) ----------
+# Reevalua 216 variantes con datos recientes y adopta solo la que pase la validacion
+AUTOTUNE=true
+# apply = aplica el cambio | suggest = solo lo propone por Telegram
+AUTOTUNE_MODE=apply
+AUTOTUNE_HOURS=24
+AUTOTUNE_DAYS=21
+# 0 = todas las monedas. Si pones un numero: 1/3 liquidas + muestra aleatoria rotativa del resto
+AUTOTUNE_TOP=0
+AUTOTUNE_MAX_MINUTES=25
+AUTOTUNE_MIN_TRADES=40
+AUTOTUNE_Z=2.2
+AUTOTUNE_MIN_GAIN_R=0.10
 
 # ---------- LOGICA QT (avanzado) ----------
-REQUIRE_CHAIN=true
+# false = la cadena suma puntos pero no es obligatoria (mas senales, todos los dias)
+REQUIRE_CHAIN=false
 # none | true_opens
 BIAS_MODE=true_opens
 # manipulacion | tendencia
@@ -70,8 +116,9 @@ MIN_SWEEP_ATR=0.2
 MAX_SWEEP_ATR=3
 SL_BUF_ATR=0.1
 
-# ---------- SISTEMA (opcionales) ----------
-# BINANCE_BASE_URL=https://fapi.binance.com
-# Solo si montas un Volume en Railway con mount path /data
-# STATE_FILE=/data/state.json
+# ---------- SISTEMA ----------
+# MUY recomendado con el autoajuste: crea un Volume en Railway con mount path /data
+# (sin el, los parametros ajustados se pierden al redesplegar)
+STATE_FILE=/data/state.json
+# BASE_URL=https://open-api.bingx.com
 # LOG_LEVEL=INFO
