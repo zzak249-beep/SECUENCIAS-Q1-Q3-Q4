@@ -6,7 +6,7 @@ Escanea los perpetuos USDT de BingX más líquidos, detecta **rupturas tras comp
 
 ## Qué hace
 
-1. Cada `SCAN_INTERVAL_MIN` minutos descarga el top N de perpetuos USDT por volumen 24h (usa ccxt, API pública, **no necesita claves de BingX**).
+1. Cada `SCAN_INTERVAL_MIN` minutos descarga **todos** los perpetuos USDT (o el top N si pones `TOP_N`) (usa ccxt, API pública, **no necesita claves de BingX**).
 2. Solo analiza **velas cerradas** (nunca la vela en formación).
 3. Busca: squeeze reciente + ruptura de banda + volumen por encima de la media + pendiente wavelet en la dirección de la ruptura.
 4. Puntúa de 0 a 100 (profundidad del squeeze, volumen, fuerza de la pendiente, acuerdo con la TF superior, calidad de la ruptura).
@@ -71,7 +71,9 @@ Si los logs muestran errores 403/451 al consultar BingX, cambia la región del s
 | `MIN_SCORE` | Sube (70+) para menos señales y más selectivas |
 | `TIMEFRAME` / `HTF_TIMEFRAME` | Por defecto 1h y 4h |
 | `REQUIRE_HTF=true` | Exige que la TF superior apunte en la misma dirección |
-| `TOP_N`, `MIN_VOLUME_USD` | Tamaño y liquidez del universo |
+| `TOP_N` | `0` = todas las monedas (por defecto); un número = solo el top N por volumen |
+| `MIN_VOLUME_USD` | Volumen 24h mínimo (por defecto 300000); `0` = sin filtro |
+| `RATE_LIMIT_MS`, `MAX_RETRIES` | Ritmo de peticiones y reintentos (error 100410 de BingX) |
 | `ACCOUNT_USD`, `RISK_PCT`, `MAX_LEVERAGE` | Para calcular el tamaño sugerido (solo informativo) |
 | `MAX_EXTENSION_ATR` | Descarta rupturas que ya se alejaron demasiado de la banda |
 | `EXCLUDE_PREFIXES` | Prefijos de activos tradicionales de BingX a ignorar; edítalo si ves símbolos raros |

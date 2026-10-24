@@ -25,15 +25,40 @@ def make_exchange():
     return ccxt.bingx(
         {
             "enableRateLimit": True,
+            "rateLimit": CFG.rate_limit_ms,
             "timeout": 20000,
             "options": {"defaultType": "swap"},
         }
     )
 
 
+def _retryable(e):
+    if isinstance(e, ccxt.NetworkError):  # incluye RateLimitExceeded, timeouts, caídas
+        return True
+    msg = str(e).lower()
+    return "100410" in msg or "rate limit" in msg or "too many" in msg
+
+
+def call(ex, fn, *args, **kwargs):
+    """Llama a la API con reintentos y pausa adaptativa (BingX devuelve 100410 si vamos muy rápido)."""
+    delay = 2.0
+    for attempt in range(CFG.max_retries + 1):
+        try:
+            res = fn(*args, **kwargs)
+            ex.rateLimit = max(CFG.rate_limit_ms, ex.rateLimit * 0.98)  # relaja poco a poco
+            return res
+        except ccxt.BaseError as e:
+            if not _retryable(e) or attempt == CFG.max_retries:
+                raise
+            ex.rateLimit = min(ex.rateLimit * 1.5, 3000)  # frena el ritmo
+            log.debug("Reintento %d en %.0fs (rateLimit=%dms): %s", attempt + 1, delay, ex.rateLimit, str(e)[:80])
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+
 def fetch_df(ex, symbol, timeframe, limit):
     """Devuelve DataFrame de velas CERRADAS (descarta la vela en formación)."""
-    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    raw = call(ex, ex.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
     if not raw or len(raw) < 10:
         return None
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -47,8 +72,8 @@ def fetch_df(ex, symbol, timeframe, limit):
 
 def get_universe(ex):
     """Top N perpetuos USDT por volumen 24h, filtrando stablecoins y activos tradicionales."""
-    ex.load_markets()
-    tickers = ex.fetch_tickers()
+    call(ex, ex.load_markets)
+    tickers = call(ex, ex.fetch_tickers)
     rows = []
     for sym, t in tickers.items():
         m = ex.markets.get(sym)
@@ -64,16 +89,19 @@ def get_universe(ex):
         vol = t.get("quoteVolume")
         if not vol:
             vol = (t.get("baseVolume") or 0) * (t.get("last") or 0)
-        if not vol or vol < CFG.min_volume_usd:
+        if CFG.min_volume_usd > 0 and (not vol or vol < CFG.min_volume_usd):
             continue
         rows.append((sym, float(vol)))
     rows.sort(key=lambda r: r[1], reverse=True)
-    return [s for s, _ in rows[: CFG.top_n]]
+    if CFG.top_n > 0:
+        rows = rows[: CFG.top_n]
+    return [s for s, _ in rows]
 
 
 def scan_once(ex, last_signal):
     symbols = get_universe(ex)
     log.info("Universo: %d símbolos (TF %s, HTF %s)", len(symbols), CFG.timeframe, CFG.htf)
+    t0 = time.time()
     signals, watch = [], []
     now = time.time()
 
@@ -98,6 +126,7 @@ def scan_once(ex, last_signal):
             last_signal[key] = now
             signals.append(sig)
 
+    log.info("Escaneo completado en %.0fs", time.time() - t0)
     signals.sort(key=lambda s: s["score"], reverse=True)
     watch.sort(key=lambda w: w["depth_pct"])
     return signals, watch
@@ -115,7 +144,8 @@ def main():
     if CFG.send_startup:
         notifier.send(
             "🤖 <b>Scanner BingX iniciado</b>\n"
-            f"TF {CFG.timeframe} (HTF {CFG.htf}) · top {CFG.top_n} por volumen\n"
+            f"TF {CFG.timeframe} (HTF {CFG.htf}) · "
+            f"{'todas las monedas' if CFG.top_n <= 0 else 'top ' + str(CFG.top_n)}\n"
             f"Score mínimo {CFG.min_score:g} · escaneo cada {CFG.scan_interval_min} min\n"
             "<i>Solo señales, sin ejecución automática.</i>"
         )

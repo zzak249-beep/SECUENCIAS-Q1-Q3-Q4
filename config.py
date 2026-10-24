@@ -39,11 +39,15 @@ class Config:
         self.timeframe = _s("TIMEFRAME", "1h")
         self.htf = _s("HTF_TIMEFRAME", "4h")          # temporalidad superior (confluencia)
         self.candles = _i("CANDLES", 300)
-        self.top_n = _i("TOP_N", 80)                  # top N por volumen 24h
-        self.min_volume_usd = _f("MIN_VOLUME_USD", 5_000_000)
+        self.top_n = _i("TOP_N", 0)                   # 0 = TODAS las monedas; N = top N por volumen 24h
+        self.min_volume_usd = _f("MIN_VOLUME_USD", 300_000)  # 0 = sin filtro de liquidez
         self.exclude_bases = _l("EXCLUDE_BASES", "USDC,FDUSD,TUSD,BUSD,USDT")
         # Prefijos de activos tradicionales (acciones/commodities/forex) de BingX. Edítalo si ves símbolos raros.
         self.exclude_prefixes = _l("EXCLUDE_PREFIXES", "NCSK,NCCO,NCFX,NCSI")
+
+        # --- Límites de la API de BingX ---
+        self.rate_limit_ms = _i("RATE_LIMIT_MS", 350)   # pausa mínima entre peticiones
+        self.max_retries = _i("MAX_RETRIES", 4)         # reintentos ante error 100410 / red
 
         # --- Frecuencia ---
         self.scan_interval_min = _i("SCAN_INTERVAL_MIN", 15)
